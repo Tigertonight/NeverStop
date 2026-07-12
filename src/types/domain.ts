@@ -101,3 +101,11 @@ export interface DataSource {
   status: 'native_required' | 'web_oauth' | 'planned'
   detail: string
 }
+
+export interface ManualRecordInput {
+  sport: Sport
+  distance: number
+  minutes: number
+  seconds: number
+  date: string
+}
