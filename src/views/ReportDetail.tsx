@@ -2,14 +2,15 @@ import { useEffect, useRef, useState } from 'react'
 import { Activity, Check, ChevronRight, Info, Share2, TimerReset, TrendingUp, X } from 'lucide-react'
 import { DemoNotice, EvidenceOverlay, ScoreRing, SectionHeading, SportIcon, TopBar } from '../components/ui'
 import { correctSwimStroke, submitInsightFeedback } from '../lib/analysis-api'
+import { loadReportFeedback, persistInsightFeedback } from '../lib/feedback-storage'
 import { formatReportDate } from '../lib/format'
 import type { AnalysisReport } from '../types/domain'
 
-export function ReportDetail({ report, onBack, onToast }: { report: AnalysisReport; onBack: () => void; onToast: (message: string) => void }) {
+export function ReportDetail({ report, onBack, onToast, onReanalyze }: { report: AnalysisReport; onBack: () => void; onToast: (message: string) => void; onReanalyze?: (report: AnalysisReport) => void }) {
   const [displayReport, setDisplayReport] = useState(report)
   const [activeInsight, setActiveInsight] = useState(report.insights[0])
   const [showStrokeChoices, setShowStrokeChoices] = useState(false)
-  const [feedback, setFeedback] = useState<Record<string, string>>({})
+  const [feedback, setFeedback] = useState<Record<string, string>>(() => loadReportFeedback(report.id))
   const evidenceRef = useRef<HTMLElement | null>(null)
   const isDemo = report.source === 'demo'
   const activeEvidenceIndex = Math.max(0, report.insights.findIndex((insight) => insight.id === activeInsight.id))
@@ -18,6 +19,7 @@ export function ReportDetail({ report, onBack, onToast }: { report: AnalysisRepo
   useEffect(() => {
     setDisplayReport(report)
     setActiveInsight(report.insights[0])
+    setFeedback(loadReportFeedback(report.id))
   }, [report])
 
   const updateStroke = async (stroke: 'freestyle' | 'breaststroke' | 'backstroke' | 'butterfly') => {
@@ -35,6 +37,7 @@ export function ReportDetail({ report, onBack, onToast }: { report: AnalysisRepo
     try {
       await submitInsightFeedback(report.id, activeInsight.id, value)
       setFeedback((current) => ({ ...current, [activeInsight.id]: value }))
+      persistInsightFeedback(report.id, activeInsight.id, value)
       onToast('反馈已记录')
     } catch (error) {
       onToast(error instanceof Error ? error.message : '反馈提交失败')
@@ -62,7 +65,7 @@ export function ReportDetail({ report, onBack, onToast }: { report: AnalysisRepo
         <section className="report-hero">
           <div className="report-meta"><span className={`sport-tag ${displayReport.sport}`}><SportIcon sport={displayReport.sport} size={15} />{displayReport.sport === 'running' ? '跑步' : displayReport.swimStroke?.strokeName ?? '游泳'}</span>{displayReport.swimStroke ? <span>泳姿置信度 {displayReport.swimStroke.confidence}%</span> : null}<span>{isDemo ? '示例报告' : formatReportDate(displayReport)}</span><span>{report.duration}</span></div>
           {!isDemo && displayReport.swimStroke ? <div className="stroke-confirm"><span>识别泳姿是否正确？</span><button className="secondary-button compact" onClick={() => onToast('已确认当前泳姿') }><Check size={15} />正确</button><button className="text-button" onClick={() => setShowStrokeChoices((value) => !value)}>修改</button>{showStrokeChoices ? <div className="stroke-options">{([['freestyle', '自由泳'], ['breaststroke', '蛙泳'], ['backstroke', '仰泳'], ['butterfly', '蝶泳']] as const).map(([value, label]) => <button key={value} onClick={() => updateStroke(value)}>{label}</button>)}</div> : null}</div> : null}
-          {displayReport.adviceNeedsReanalysis ? <div className="quality-warning"><Info size={17} />泳姿已修正，当前证据仍来自原分析，请重新上传后生成对应专项建议。</div> : null}
+          {displayReport.adviceNeedsReanalysis ? <div className="quality-warning reanalyze"><Info size={17} /><div><strong>泳姿已修正</strong><p>当前证据仍来自原分析。重新上传同一段视频，即可生成对应泳姿的专项建议。</p>{onReanalyze ? <button className="secondary-button compact" type="button" onClick={() => onReanalyze(displayReport)}><TimerReset size={15} />重新分析这段视频</button> : null}</div></div> : null}
           {report.qualityAssessment?.status === 'limited' ? <div className="quality-warning"><Info size={17} /><div><strong>本次证据有限</strong><p>{report.qualityAssessment.blockingIssues.join('；')}</p></div></div> : null}
           <div className={`report-title-row ${isDemo ? '' : 'without-score'}`}><div><span className="eyebrow">{isDemo ? 'AI 动作总结示例' : displayReport.displayName ?? 'AI 动作总结'}</span><h1>{report.headline}</h1></div>{isDemo ? <ScoreRing score={report.score} compact /> : null}</div>
           <p>{report.summary}</p>

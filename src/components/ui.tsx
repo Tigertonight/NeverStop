@@ -1,5 +1,6 @@
-import { type ReactNode } from 'react'
+import { useState, type ReactNode } from 'react'
 import {
+  AlertTriangle,
   ArrowLeft,
   Check,
   Footprints,
@@ -9,8 +10,50 @@ import {
   Waves,
 } from 'lucide-react'
 import { navItems } from './nav'
+import { useModalDismiss } from '../hooks/useModalDismiss'
 import { defaultReportName, formatReportDate, formatWorkoutDate } from '../lib/format'
 import type { AnalysisReport, AppTab, Insight, Sport, WorkoutRecord } from '../types/domain'
+
+/**
+ * 应用内一致的确认弹窗，替代原生 window.confirm。
+ * onConfirm 可返回 Promise：进行中禁用按钮、失败时展示行内错误。
+ */
+export function ConfirmDialog({ title, description, confirmLabel = '确认', cancelLabel = '取消', tone = 'danger', onConfirm, onCancel }: {
+  title: string
+  description?: ReactNode
+  confirmLabel?: string
+  cancelLabel?: string
+  tone?: 'danger' | 'primary'
+  onConfirm: () => void | Promise<void>
+  onCancel: () => void
+}) {
+  const dialogRef = useModalDismiss<HTMLDivElement>(onCancel)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const confirm = async () => {
+    setBusy(true)
+    try {
+      await onConfirm()
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '操作失败，请重试。')
+      setBusy(false)
+    }
+  }
+  return (
+    <div className="modal-backdrop confirm-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) onCancel() }}>
+      <div ref={dialogRef} className="confirm-sheet" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby={description ? 'confirm-desc' : undefined} tabIndex={-1}>
+        <div className={`confirm-icon ${tone}`}><AlertTriangle size={22} /></div>
+        <h2 id="confirm-title">{title}</h2>
+        {description ? <p id="confirm-desc" className="confirm-desc">{description}</p> : null}
+        {error ? <div className="form-error standalone" role="alert">{error}</div> : null}
+        <div className="confirm-actions">
+          <button className="secondary-button wide" type="button" disabled={busy} onClick={onCancel}>{cancelLabel}</button>
+          <button className={`${tone === 'danger' ? 'danger-button' : 'primary-button'} wide`} type="button" disabled={busy} onClick={confirm}>{busy ? '处理中…' : confirmLabel}</button>
+        </div>
+      </div>
+    </div>
+  )
+}
 
 export function SportIcon({ sport, size = 18 }: { sport: Sport; size?: number }) {
   return sport === 'running' ? <Footprints size={size} /> : <Waves size={size} />

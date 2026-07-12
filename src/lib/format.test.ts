@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { defaultReportName, formatReportDate, formatWorkoutDate, getGreeting, todayValue } from './format'
+import { defaultReportName, formatReportDate, formatReportGroupLabel, formatWorkoutDate, getGreeting, groupReportsByDate, reportMatchesQuery, todayValue } from './format'
 import type { AnalysisReport } from '../types/domain'
 
 function makeReport(partial: Partial<AnalysisReport>): AnalysisReport {
@@ -86,5 +86,65 @@ describe('defaultReportName', () => {
 
   it('falls back to title', () => {
     expect(defaultReportName(makeReport({ title: '跑步分析' }))).toBe('跑步分析')
+  })
+})
+
+describe('formatReportGroupLabel', () => {
+  afterEach(() => vi.useRealTimers())
+
+  it('labels empty key as 示例报告', () => {
+    expect(formatReportGroupLabel('')).toBe('示例报告')
+  })
+
+  it('labels today and yesterday', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-03-09T10:00:00'))
+    expect(formatReportGroupLabel('2026-03-09')).toBe('今天')
+    expect(formatReportGroupLabel('2026-03-08')).toBe('昨天')
+  })
+
+  it('drops year for same-year dates', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-03-09T10:00:00'))
+    expect(formatReportGroupLabel('2026-01-02')).toBe('1月2日')
+    expect(formatReportGroupLabel('2025-12-31')).toBe('2025年12月31日')
+  })
+})
+
+describe('groupReportsByDate', () => {
+  it('groups by date, newest first, demo (no date) last', () => {
+    const groups = groupReportsByDate([
+      makeReport({ id: 'a', trainingDate: '2026-03-01' }),
+      makeReport({ id: 'demo', source: 'demo' }),
+      makeReport({ id: 'b', trainingDate: '2026-03-05' }),
+      makeReport({ id: 'c', trainingDate: '2026-03-05' }),
+    ])
+    expect(groups.map((g) => g.key)).toEqual(['2026-03-05', '2026-03-01', ''])
+    expect(groups[0].reports.map((r) => r.id)).toEqual(['b', 'c'])
+    expect(groups[2].reports.map((r) => r.id)).toEqual(['demo'])
+  })
+
+  it('uses createdAt date when trainingDate missing', () => {
+    const groups = groupReportsByDate([makeReport({ id: 'x', createdAt: '2026-03-09T08:00:00' })])
+    expect(groups[0].key).toBe('2026-03-09')
+  })
+})
+
+describe('reportMatchesQuery', () => {
+  const report = makeReport({ displayName: '周一晨泳', headline: '入水点越过中线', swimStroke: { stroke: 'freestyle', strokeName: '自由泳', confidence: 90, candidates: [] } })
+
+  it('matches empty query', () => {
+    expect(reportMatchesQuery(report, '')).toBe(true)
+    expect(reportMatchesQuery(report, '   ')).toBe(true)
+  })
+
+  it('matches on name, headline and stroke name, case-insensitive', () => {
+    expect(reportMatchesQuery(report, '晨泳')).toBe(true)
+    expect(reportMatchesQuery(report, '中线')).toBe(true)
+    expect(reportMatchesQuery(report, '自由泳')).toBe(true)
+  })
+
+  it('returns false when nothing matches', () => {
+    expect(reportMatchesQuery(report, '蝶泳')).toBe(false)
   })
 })

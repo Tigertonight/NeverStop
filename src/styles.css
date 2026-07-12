@@ -453,3 +453,38 @@ h1, h2, h3, p { margin: 0; text-wrap: pretty; }
 .app-error-card p { margin: 0 0 12px; color: var(--muted, #64748b); }
 .app-error-detail { display: block; margin-bottom: 20px; font-size: 12px; color: var(--muted, #94a3b8); word-break: break-word; }
 .app-error-actions { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
+
+/* ---- 应用内确认弹窗 (F1) ---- */
+.confirm-backdrop { align-items: center; padding: 24px; }
+.confirm-sheet { width: min(100%, 380px); padding: 24px 22px calc(22px + env(safe-area-inset-bottom)); text-align: center; background: var(--surface); border-radius: 14px; box-shadow: 0 18px 52px rgba(0,0,0,0.4); animation: sheet-in 200ms ease-out; }
+.confirm-icon { width: 48px; height: 48px; margin: 0 auto 14px; display: grid; place-items: center; border-radius: 50%; }
+.confirm-icon.danger { color: var(--negative); background: rgba(243,114,127,0.12); }
+.confirm-icon.primary { color: var(--brand); background: rgba(30,215,96,0.12); }
+.confirm-sheet h2 { font-size: 17px; line-height: 1.4; }
+.confirm-desc { margin-top: 8px; color: var(--ink-muted); font-size: 13px; line-height: 1.55; }
+.confirm-actions { display: flex; gap: 10px; margin-top: 20px; }
+.confirm-actions .secondary-button, .confirm-actions .primary-button, .confirm-actions .danger-button { flex: 1; margin-top: 0; }
+
+/* ---- 报告搜索与日期分组 (F2) ---- */
+.report-search { display: flex; align-items: center; gap: 9px; margin-top: 16px; padding: 0 13px; height: 46px; color: var(--ink-muted); background: var(--surface-raised); border: 1px solid var(--hairline); border-radius: 999px; }
+.report-search svg { flex: 0 0 auto; }
+.report-search input { flex: 1; min-width: 0; height: 100%; color: var(--ink); background: transparent; border: none; outline: none; font-size: 14px; }
+.report-search input::placeholder { color: var(--ink-subtle); }
+.report-search .icon-button { flex: 0 0 auto; }
+.report-group { margin-bottom: 22px; }
+.report-group-title { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; color: var(--ink-muted); font-size: 13px; font-weight: 750; }
+.report-group-title span { display: inline-grid; place-items: center; min-width: 20px; height: 20px; padding: 0 6px; color: var(--ink-subtle); background: var(--surface-raised); border-radius: 999px; font-size: 11px; }
+
+/* ---- 分析失败与重试 (F3) ---- */
+.analysis-failure { display: flex; align-items: flex-start; gap: 9px; margin-top: 12px; padding: 12px; border-radius: var(--radius); font-size: 12px; line-height: 1.55; }
+.analysis-failure svg { flex: 0 0 auto; margin-top: 1px; }
+.analysis-failure strong { display: block; font-size: 13px; }
+.analysis-failure p { margin-top: 3px; color: var(--ink-muted); }
+.analysis-failure.connection { color: #ffd166; background: rgba(255,209,102,0.09); border-left: 3px solid #ffd166; }
+.analysis-failure.server { color: var(--negative); background: rgba(243,114,127,0.1); border-left: 3px solid var(--negative); }
+.analysis-failure.rejected { color: var(--ink); background: var(--surface-raised); border-left: 3px solid var(--hairline-strong); }
+
+/* ---- 泳姿修正后引导重新分析 (F5) ---- */
+.quality-warning.reanalyze { flex-direction: row; }
+.quality-warning.reanalyze .secondary-button { margin-top: 10px; color: var(--ink); }
+

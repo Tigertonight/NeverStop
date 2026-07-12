@@ -1,12 +1,37 @@
 import { useEffect, useRef, useState, type ChangeEvent, type DragEvent } from 'react'
 import { useSearchParams } from 'react-router-dom'
-import { ArrowRight, Camera, Check, FileVideo2, Gauge, RotateCcw, ShieldCheck, Sparkles, Upload, Zap } from 'lucide-react'
+import { AlertTriangle, ArrowRight, Camera, Check, FileVideo2, Gauge, RefreshCcw, RotateCcw, ShieldCheck, Sparkles, Upload, Zap } from 'lucide-react'
 import { DemoNotice, ScoreRing, SectionHeading, SportIcon, SportSelector, TopBar } from '../components/ui'
-import { createAnalysisJob, getAnalysisJob, getAnalysisReport } from '../lib/analysis-api'
+import { AnalysisApiError, analysisApiHost, createAnalysisJob, getAnalysisJob, getAnalysisReport } from '../lib/analysis-api'
 import { reports } from '../data/demo'
 import type { AnalysisReport, Sport } from '../types/domain'
 
 type AnalysisPhase = 'idle' | 'validating' | 'ready' | 'analyzing' | 'done'
+
+/** 分析失败的分类，决定提示文案与可否原样重试。 */
+type AnalysisFailure = {
+  message: string
+  hint: string
+  /** connection: 服务未连上，可直接重试；rejected: 视频本身不合适，需换视频；server: 服务异常，可稍后重试。 */
+  kind: 'connection' | 'rejected' | 'server'
+}
+
+/** 视频不适合分析、需要用户更换的错误码（重试无意义）。 */
+const REJECT_CODES = new Set(['SPORT_MISMATCH', 'SPORT_NOT_SUPPORTED', 'NO_POSE_DETECTED', 'INSUFFICIENT_MOTION', 'VIDEO_TOO_SHORT'])
+
+function classifyFailure(error: unknown, jobErrorCode?: string | null): AnalysisFailure {
+  const message = error instanceof Error ? error.message : '视频分析失败，请重新尝试。'
+  if (error instanceof AnalysisApiError && error.status === undefined) {
+    return { kind: 'connection', message: '无法连接本地分析服务。', hint: `请确认分析服务已在 ${analysisApiHost()} 启动后重试。` }
+  }
+  if (jobErrorCode && REJECT_CODES.has(jobErrorCode)) {
+    return { kind: 'rejected', message, hint: '这段视频不适合本次分析，请按拍摄建议换一段视频。' }
+  }
+  if (error instanceof AnalysisApiError && error.status && error.status >= 500) {
+    return { kind: 'server', message: '分析服务出现异常。', hint: '请稍后重试；若持续失败可重启本机分析服务。' }
+  }
+  return { kind: 'server', message, hint: '可重新开始分析，或更换一段视频。' }
+}
 
 export function AnalyzeView({ onReportReady, onOpenReport }: { onReportReady: (report: AnalysisReport) => void; onOpenReport: (report: AnalysisReport) => void }) {
   const [searchParams, setSearchParams] = useSearchParams()
@@ -21,6 +46,7 @@ export function AnalyzeView({ onReportReady, onOpenReport }: { onReportReady: (r
   const [completedReport, setCompletedReport] = useState<AnalysisReport | null>(null)
   const [isDemoAnalysis, setIsDemoAnalysis] = useState(false)
   const [validationError, setValidationError] = useState('')
+  const [analysisFailure, setAnalysisFailure] = useState<AnalysisFailure | null>(null)
   const [isDragging, setIsDragging] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
   const timerRef = useRef<number | null>(null)
@@ -44,6 +70,7 @@ export function AnalyzeView({ onReportReady, onOpenReport }: { onReportReady: (r
     setCompletedReport(null)
     setIsDemoAnalysis(false)
     setValidationError('')
+    setAnalysisFailure(null)
     setIsDragging(false)
     dragDepthRef.current = 0
     setPhase('idle')
@@ -62,6 +89,7 @@ export function AnalyzeView({ onReportReady, onOpenReport }: { onReportReady: (r
 
   const processVideoFile = (file: File) => {
     setValidationError('')
+    setAnalysisFailure(null)
     const hasSupportedExtension = /\.(mp4|mov)$/i.test(file.name)
     if (!['video/mp4', 'video/quicktime'].includes(file.type) && !hasSupportedExtension) {
       setValidationError('暂不支持此格式，请选择 MP4 或 MOV 视频。')
@@ -167,9 +195,11 @@ export function AnalyzeView({ onReportReady, onOpenReport }: { onReportReady: (r
     const currentRun = ++runRef.current
     setIsDemoAnalysis(false)
     setValidationError('')
+    setAnalysisFailure(null)
     setAnalysisStage('正在上传视频')
     setProgress(3)
     setPhase('analyzing')
+    let jobErrorCode: string | null = null
     try {
       let job = await createAnalysisJob(selectedFile, sport)
       while (job.status !== 'completed' && job.status !== 'failed') {
@@ -180,7 +210,10 @@ export function AnalyzeView({ onReportReady, onOpenReport }: { onReportReady: (r
         job = await getAnalysisJob(job.id)
       }
       if (runRef.current !== currentRun) return
-      if (job.status === 'failed' || !job.reportId) throw new Error(job.errorMessage ?? '没有生成可用报告，请重新尝试。')
+      if (job.status === 'failed' || !job.reportId) {
+        jobErrorCode = job.errorCode ?? null
+        throw new Error(job.errorMessage ?? '没有生成可用报告，请重新尝试。')
+      }
       const nextReport = await getAnalysisReport(job.reportId)
       if (runRef.current !== currentRun) return
       setCompletedReport(nextReport)
@@ -193,7 +226,7 @@ export function AnalyzeView({ onReportReady, onOpenReport }: { onReportReady: (r
       if (runRef.current !== currentRun) return
       setPhase('ready')
       setProgress(0)
-      setValidationError(error instanceof Error ? error.message : '视频分析失败，请重新尝试。')
+      setAnalysisFailure(classifyFailure(error, jobErrorCode))
     }
   }
 
@@ -241,7 +274,17 @@ export function AnalyzeView({ onReportReady, onOpenReport }: { onReportReady: (r
             <div className="video-frame"><video src={videoUrl} controls playsInline preload="metadata" /><span className={`sport-badge ${sport}`}><SportIcon sport={sport} size={14} />{sport === 'running' ? '跑步' : '自动识别泳姿'}</span></div>
             <div className="file-row"><FileVideo2 size={20} /><div><strong>{fileName}</strong><span>将在本机分析服务中抽帧并识别姿态</span></div><Check size={18} className="success" /></div>
             {validationError ? <div className="form-error standalone" role="alert">{validationError}</div> : null}
-            <button className="primary-button wide" onClick={startAnalysis}><Sparkles size={18} /> 开始真实分析</button>
+            {analysisFailure ? (
+              <div className={`analysis-failure ${analysisFailure.kind}`} role="alert">
+                <AlertTriangle size={18} />
+                <div><strong>{analysisFailure.message}</strong><p>{analysisFailure.hint}</p></div>
+              </div>
+            ) : null}
+            {analysisFailure?.kind === 'rejected' ? (
+              <button className="primary-button wide" onClick={() => inputRef.current?.click()}><Upload size={18} /> 更换视频</button>
+            ) : (
+              <button className="primary-button wide" onClick={startAnalysis}>{analysisFailure ? <><RefreshCcw size={18} /> 重试分析</> : <><Sparkles size={18} /> 开始真实分析</>}</button>
+            )}
             <button className="secondary-button wide" onClick={() => inputRef.current?.click()}><RotateCcw size={17} /> 重新选择</button>
             <input ref={inputRef} type="file" accept="video/mp4,video/quicktime" onChange={handleFile} hidden />
           </section>

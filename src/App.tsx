@@ -102,7 +102,7 @@ function App() {
           <Route path="/" element={<HomeView workouts={workouts} latestReport={localReports[0]} onAnalyze={(sport) => navigate(`/analyze?sport=${sport}`)} onOpenReport={openReport} onOpenReports={() => navigate('/reports')} onProfile={() => navigate('/me')} />} />
           <Route path="/analyze" element={<AnalyzeView onReportReady={saveReport} onOpenReport={openReport} />} />
           <Route path="/reports" element={<ReportsView allReports={allReports} onOpenReport={openReport} onUpdateReport={updateReportRecord} onDeleteReport={deleteReportRecord} onBack={() => navigate('/progress')} />} />
-          <Route path="/reports/:reportId" element={<ReportRoute allReports={allReports} onLoaded={saveReport} onBack={() => navigate('/reports')} onToast={showToast} />} />
+          <Route path="/reports/:reportId" element={<ReportRoute allReports={allReports} onLoaded={saveReport} onBack={() => navigate('/reports')} onToast={showToast} onReanalyze={(report) => { showToast('已为你打开分析页，请重新上传同一段视频'); navigate(`/analyze?sport=${report.sport}`) }} />} />
           <Route path="/progress" element={<ProgressView onOpenReports={() => navigate('/reports')} />} />
           <Route path="/me" element={<ProfileView workouts={workouts} onSaveWorkout={saveWorkout} onToast={showToast} />} />
           <Route path="*" element={<Navigate to="/" replace />} />
@@ -114,7 +114,7 @@ function App() {
   )
 }
 
-function ReportRoute({ allReports, onLoaded, onBack, onToast }: { allReports: AnalysisReport[]; onLoaded: (report: AnalysisReport) => void; onBack: () => void; onToast: (message: string) => void }) {
+function ReportRoute({ allReports, onLoaded, onBack, onToast, onReanalyze }: { allReports: AnalysisReport[]; onLoaded: (report: AnalysisReport) => void; onBack: () => void; onToast: (message: string) => void; onReanalyze: (report: AnalysisReport) => void }) {
   const { reportId } = useParams()
   const cached = allReports.find((item) => item.id === reportId)
   const [report, setReport] = useState<AnalysisReport | null>(cached ?? null)
@@ -130,7 +130,7 @@ function ReportRoute({ allReports, onLoaded, onBack, onToast }: { allReports: An
     }).catch(() => { if (!cached) setFailed(true) })
   }, [cached, onLoaded, reportId])
 
-  if (report) return <ReportDetail report={report} onBack={onBack} onToast={onToast} />
+  if (report) return <ReportDetail report={report} onBack={onBack} onToast={onToast} onReanalyze={onReanalyze} />
   if (failed) return <Navigate to="/reports" replace />
   return <main className="route-loading"><span className="scan-line" /><p>正在加载动作报告</p></main>
 }
