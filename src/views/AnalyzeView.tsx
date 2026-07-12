@@ -82,7 +82,21 @@ export function AnalyzeView({ onReportReady, onOpenReport }: { onReportReady: (r
   }
 
   const chooseSport = (nextSport: Sport) => {
+    if (nextSport === sport) return
     setSport(nextSport)
+    // 已选好视频时保留视频，仅退回可分析状态，避免选错运动类型后被迫重传
+    if (selectedFile && (phase === 'ready' || phase === 'done')) {
+      if (timerRef.current) window.clearInterval(timerRef.current)
+      setCompletedReport(null)
+      setIsDemoAnalysis(false)
+      setProgress(0)
+      setAnalysisStage('')
+      setValidationError('')
+      setAnalysisFailure(null)
+      setPhase('ready')
+      setSearchParams({ sport: nextSport }, { replace: true })
+      return
+    }
     clearAnalysisState()
     setSearchParams({ sport: nextSport })
   }
