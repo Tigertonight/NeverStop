@@ -118,20 +118,35 @@ def _archived_source_path(source_hash: str) -> Path | None:
     return matches[0] if matches else None
 
 
+def _prune_source_videos(keep: Path | None = None) -> None:
+    """只保留用户最近一次上传的源视频，删除 SOURCE_DIR 下其它所有归档。"""
+    for existing in SOURCE_DIR.glob("*"):
+        if not existing.is_file():
+            continue
+        if keep is not None and existing == keep:
+            continue
+        existing.unlink(missing_ok=True)
+
+
 def _archive_source_video(upload_path: Path, source_hash: str) -> None:
-    """分析成功后把上传视频按 sourceHash 归档去重，失败/已存在则清理临时文件。"""
+    """分析成功后归档源视频；只保留最近一次上传的视频，清理其它旧归档。"""
     if not source_hash or not upload_path.exists():
         upload_path.unlink(missing_ok=True)
+        _prune_source_videos()
         return
     target = SOURCE_DIR / f"{source_hash}{upload_path.suffix.lower()}"
     if target.exists():
         upload_path.unlink(missing_ok=True)
+        _prune_source_videos(keep=target)
         return
     try:
         shutil.move(str(upload_path), str(target))
     except OSError:
         logger.exception("Failed to archive source video for %s", source_hash)
         upload_path.unlink(missing_ok=True)
+        _prune_source_videos()
+        return
+    _prune_source_videos(keep=target)
 
 
 def _process_job(job_id: str, report_id: str, upload_path: Path, file_name: str, sport: str, source_hash: str, swim_stroke_hint: str | None) -> None:

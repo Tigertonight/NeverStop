@@ -311,6 +311,31 @@ class ReportApiTest(unittest.TestCase):
         response = self.client.post("/api/reports/ghost/reanalyze", json={})
         self.assertEqual(response.status_code, 404)
 
+    def test_archive_keeps_only_latest_source_video(self) -> None:
+        # 归档新视频时应删除之前留下的所有旧源视频，只保留最近一次上传的。
+        (self._source_dir / "oldhash1.mp4").write_bytes(b"old-1")
+        (self._source_dir / "oldhash2.mov").write_bytes(b"old-2")
+        staged = self._upload_dir / "job-new.mp4"
+        staged.write_bytes(b"newest")
+
+        main._archive_source_video(staged, "newhash")
+
+        remaining = sorted(p.name for p in self._source_dir.glob("*"))
+        self.assertEqual(remaining, ["newhash.mp4"])
+        self.assertFalse(staged.exists())  # 临时文件已被移动
+
+    def test_reanalyze_same_video_keeps_its_source(self) -> None:
+        # 重新分析用的是同一视频(同 hash)，归档时不应把自己删掉。
+        target = self._source_dir / "samehash.mp4"
+        target.write_bytes(b"archived")
+        staged = self._upload_dir / "job-re.mp4"
+        staged.write_bytes(b"copy-of-archived")
+
+        main._archive_source_video(staged, "samehash")
+
+        remaining = sorted(p.name for p in self._source_dir.glob("*"))
+        self.assertEqual(remaining, ["samehash.mp4"])
+
     # ---- feedback -----------------------------------------------------
 
     def test_feedback_is_appended_to_file(self) -> None:
