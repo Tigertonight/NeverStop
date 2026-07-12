@@ -13,10 +13,6 @@ export interface Metric {
 export interface Insight {
   id: string
   title: string
-  displayName?: string
-  createdAt?: string
-  trainingDate?: string
-  sourceHash?: string
   summary: string
   impact?: string
   action: string
@@ -35,6 +31,10 @@ export interface AnalysisReport {
   sport: Sport
   title: string
   date: string
+  displayName?: string
+  createdAt?: string
+  trainingDate?: string
+  sourceHash?: string
   duration: string
   score: number
   headline: string

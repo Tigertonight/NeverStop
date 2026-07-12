@@ -3,6 +3,15 @@ import type { AnalysisReport, Sport } from '../types/domain'
 
 const API_BASE = (import.meta.env.VITE_ANALYSIS_API_URL ?? 'http://127.0.0.1:8000').replace(/\/$/, '')
 
+/** 分析服务主机名（含端口），用于向用户展示视频发往何处。 */
+export function analysisApiHost(): string {
+  try {
+    return new URL(API_BASE).host
+  } catch {
+    return API_BASE
+  }
+}
+
 export class AnalysisApiError extends Error {
   constructor(message: string, public status?: number) {
     super(message)
