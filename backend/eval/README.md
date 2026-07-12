@@ -44,6 +44,19 @@ pnpm eval:api
 真实片段需**获得录制对象授权**后再纳入评测集，且不提交进仓库
 （见 DATA-002）。建议放在 `data/eval/`（已 gitignore 数据目录）或仓库外目录。
 
+## 固定回归测试视频
+
+`backend/eval/manifest.json` 已登记一个本机固定测试片段（蛙泳，绝对路径，未入库）：
+
+```bash
+.venv/bin/python -m backend.eval.run_eval --manifest backend/eval/manifest.json
+```
+
+- 期望结果：识别为 `swimming`，被正确分类（accuracy=100%）。
+- 该 manifest 指向本机 `IMG_4005.MOV` 的绝对路径（约 84MB，不入库，仅在本机有效）；
+  换机器时请更新 manifest 里的 `path` 或改用相对路径 + 授权片段。
+
+
 ## 输出解读
 
 - **accuracy**：在“成功产出报告”的片段上，预测运动与真实标签一致的比例。

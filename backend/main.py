@@ -17,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from backend.analyzer import AnalysisError, analyze_video
-from backend.model_review import review_report
+from backend.model_review import review_provider, review_report
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -205,12 +205,13 @@ def _process_job(job_id: str, report_id: str, upload_path: Path, file_name: str,
 
 @app.get("/api/health")
 def health() -> dict:
+    provider, configured = review_provider()
     return {
         "status": "ok",
         "analyzer": "mediapipe-pose",
         "storage": "local",
-        "reviewProvider": "minimax-direct" if (os.getenv("MINIMAX_ACCESS_TOKEN") or os.getenv("MINIMAX_API_KEY")) else "engineering-fallback",
-        "reviewConfigured": bool(os.getenv("MINIMAX_ACCESS_TOKEN") or os.getenv("MINIMAX_API_KEY")),
+        "reviewProvider": provider,
+        "reviewConfigured": configured,
     }
 
 
