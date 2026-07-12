@@ -107,6 +107,21 @@ class ReportApiTest(unittest.TestCase):
         self.assertEqual(body["status"], "ok")
         self.assertIn("reviewProvider", body)
 
+    def test_cors_preflight_allows_patch_and_delete(self) -> None:
+        # 前端会对报告改名/改泳姿(PATCH)与删除(DELETE)发跨域预检，
+        # 若 allow_methods 缺这些方法，浏览器会拦截并报“无法连接分析服务”。
+        for method in ("PATCH", "DELETE"):
+            response = self.client.options(
+                "/api/reports/report-1",
+                headers={
+                    "Origin": "http://localhost:5173",
+                    "Access-Control-Request-Method": method,
+                },
+            )
+            self.assertEqual(response.status_code, 200, msg=method)
+            allowed = response.headers.get("access-control-allow-methods", "")
+            self.assertIn(method, allowed, msg=f"{method} not in {allowed!r}")
+
     # ---- list / get ---------------------------------------------------
 
     def test_list_reports_returns_seeded_reports_sorted(self) -> None:

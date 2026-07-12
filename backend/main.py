@@ -59,7 +59,7 @@ app.add_middleware(
         "http://localhost:5173",
     ],
     allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 app.mount("/media", StaticFiles(directory=REPORT_DIR), name="media")
