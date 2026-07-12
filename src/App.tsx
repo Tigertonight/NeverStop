@@ -8,7 +8,7 @@ import { ReportDetail } from './views/ReportDetail'
 import { ReportsView } from './views/ReportsView'
 import { ProgressView } from './views/ProgressView'
 import { ProfileView } from './views/ProfileView'
-import { deleteAnalysisReport, getAnalysisReport, getAnalysisReports, updateAnalysisReport } from './lib/analysis-api'
+import { deleteAnalysisReport, getAnalysisJob, getAnalysisReport, getAnalysisReports, reanalyzeReport, updateAnalysisReport } from './lib/analysis-api'
 import { loadLocalReports, persistLocalReports } from './lib/report-storage'
 import { loadLocalWorkouts, persistLocalWorkouts } from './lib/workout-storage'
 import { reports } from './data/demo'
@@ -76,6 +76,34 @@ function App() {
     showToast('报告及相关证据已删除')
   }
 
+  const reanalyzeExisting = async (report: AnalysisReport) => {
+    showToast('正在用原视频重新分析…')
+    try {
+      const job = await reanalyzeReport(report.id, report.swimStroke?.stroke as 'freestyle' | 'breaststroke' | 'backstroke' | 'butterfly' | undefined)
+      let jobId = job.id
+      for (let i = 0; i < 120; i += 1) {
+        const current = await getAnalysisJob(jobId)
+        jobId = current.id
+        if (current.status === 'completed' && current.reportId) {
+          const fresh = await getAnalysisReport(current.reportId)
+          saveReport(fresh)
+          showToast('已根据原视频与泳姿重新生成报告')
+          navigate(`/reports/${fresh.id}`)
+          window.scrollTo({ top: 0, behavior: 'smooth' })
+          return
+        }
+        if (current.status === 'failed') {
+          showToast(current.errorMessage ?? '重新分析失败，请稍后重试')
+          return
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 1500))
+      }
+      showToast('重新分析超时，请稍后在报告列表查看')
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : '重新分析失败')
+    }
+  }
+
   const saveWorkout = (input: ManualRecordInput) => {
     const totalSeconds = input.minutes * 60 + input.seconds
     const nextRecord: WorkoutRecord = {
@@ -102,7 +130,7 @@ function App() {
           <Route path="/" element={<HomeView workouts={workouts} latestReport={localReports[0]} onAnalyze={(sport) => navigate(`/analyze?sport=${sport}`)} onOpenReport={openReport} onOpenReports={() => navigate('/reports')} onProfile={() => navigate('/me')} />} />
           <Route path="/analyze" element={<AnalyzeView onReportReady={saveReport} onOpenReport={openReport} />} />
           <Route path="/reports" element={<ReportsView allReports={allReports} onOpenReport={openReport} onUpdateReport={updateReportRecord} onDeleteReport={deleteReportRecord} onBack={() => navigate('/progress')} />} />
-          <Route path="/reports/:reportId" element={<ReportRoute allReports={allReports} onLoaded={saveReport} onBack={() => navigate('/reports')} onToast={showToast} onReanalyze={(report) => { showToast('已为你打开分析页，请重新上传同一段视频'); navigate(`/analyze?sport=${report.sport}`) }} />} />
+          <Route path="/reports/:reportId" element={<ReportRoute allReports={allReports} onLoaded={saveReport} onBack={() => navigate('/reports')} onToast={showToast} onReanalyze={reanalyzeExisting} />} />
           <Route path="/progress" element={<ProgressView onOpenReports={() => navigate('/reports')} />} />
           <Route path="/me" element={<ProfileView workouts={workouts} onSaveWorkout={saveWorkout} onToast={showToast} />} />
           <Route path="*" element={<Navigate to="/" replace />} />

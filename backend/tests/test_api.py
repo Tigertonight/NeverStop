@@ -67,14 +67,22 @@ class ReportApiTest(unittest.TestCase):
         self._tmp_path = Path(self._tmp.name)
         self._report_dir = self._tmp_path / "reports"
         self._report_dir.mkdir(parents=True, exist_ok=True)
+        self._source_dir = self._tmp_path / "sources"
+        self._source_dir.mkdir(parents=True, exist_ok=True)
+        self._upload_dir = self._tmp_path / "uploads"
+        self._upload_dir.mkdir(parents=True, exist_ok=True)
         self._feedback_file = self._tmp_path / "feedback.jsonl"
 
         self._orig_report_dir = main.REPORT_DIR
+        self._orig_source_dir = main.SOURCE_DIR
+        self._orig_upload_dir = main.UPLOAD_DIR
         self._orig_feedback_file = main.FEEDBACK_FILE
         self._orig_reports = main.reports
         self._orig_jobs = main.jobs
 
         main.REPORT_DIR = self._report_dir
+        main.SOURCE_DIR = self._source_dir
+        main.UPLOAD_DIR = self._upload_dir
         main.FEEDBACK_FILE = self._feedback_file
         main.reports = {}
         main.jobs = {}
@@ -83,6 +91,8 @@ class ReportApiTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         main.REPORT_DIR = self._orig_report_dir
+        main.SOURCE_DIR = self._orig_source_dir
+        main.UPLOAD_DIR = self._orig_upload_dir
         main.FEEDBACK_FILE = self._orig_feedback_file
         main.reports = self._orig_reports
         main.jobs = self._orig_jobs
@@ -242,6 +252,64 @@ class ReportApiTest(unittest.TestCase):
             json={"stroke": "sidestroke"},
         )
         self.assertEqual(response.status_code, 422)
+
+    # ---- reanalyze ----------------------------------------------------
+
+    def test_reanalyze_uses_archived_video_and_passes_stroke(self) -> None:
+        from unittest.mock import patch
+
+        report = _sample_report("re-me", sport="swimming")
+        self._seed(report)
+        # 归档一份源视频，命名需匹配 sourceHash
+        (self._source_dir / f"{report['sourceHash']}.mp4").write_bytes(b"fake-video-bytes")
+
+        captured: dict = {}
+
+        def fake_process(job_id, report_id, upload_path, file_name, sport, source_hash, swim_stroke_hint):  # noqa: ANN001
+            captured.update(
+                report_id=report_id, sport=sport, source_hash=source_hash,
+                swim_stroke_hint=swim_stroke_hint, staged_exists=Path(upload_path).exists(),
+            )
+
+        with patch.object(main, "_process_job", side_effect=fake_process):
+            response = self.client.post("/api/reports/re-me/reanalyze", json={"swimStroke": "freestyle"})
+
+        self.assertEqual(response.status_code, 202)
+        body = response.json()
+        self.assertEqual(body["status"], "queued")
+        self.assertEqual(captured["sport"], "swimming")
+        self.assertEqual(captured["source_hash"], report["sourceHash"])
+        self.assertEqual(captured["swim_stroke_hint"], "freestyle")
+        self.assertTrue(captured["staged_exists"])
+        # 重新分析用新的 report_id，不覆盖原报告
+        self.assertNotEqual(captured["report_id"], "re-me")
+
+    def test_reanalyze_falls_back_to_stored_stroke_when_unspecified(self) -> None:
+        from unittest.mock import patch
+
+        report = _sample_report("re-fallback", sport="swimming")
+        report["swimStroke"]["stroke"] = "backstroke"
+        self._seed(report)
+        (self._source_dir / f"{report['sourceHash']}.mp4").write_bytes(b"vid")
+
+        captured: dict = {}
+
+        def fake_process(*args):  # noqa: ANN002
+            captured["swim_stroke_hint"] = args[6]
+
+        with patch.object(main, "_process_job", side_effect=fake_process):
+            response = self.client.post("/api/reports/re-fallback/reanalyze", json={})
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(captured["swim_stroke_hint"], "backstroke")
+
+    def test_reanalyze_missing_source_returns_409(self) -> None:
+        self._seed(_sample_report("re-nosource", sport="swimming"))
+        response = self.client.post("/api/reports/re-nosource/reanalyze", json={})
+        self.assertEqual(response.status_code, 409)
+
+    def test_reanalyze_missing_report_returns_404(self) -> None:
+        response = self.client.post("/api/reports/ghost/reanalyze", json={})
+        self.assertEqual(response.status_code, 404)
 
     # ---- feedback -----------------------------------------------------
 

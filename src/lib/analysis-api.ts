@@ -57,6 +57,10 @@ export function correctSwimStroke(reportId: string, stroke: 'freestyle' | 'breas
   return request<AnalysisReport>(`/api/reports/${reportId}/stroke`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ stroke }) })
 }
 
+export function reanalyzeReport(reportId: string, swimStroke?: 'freestyle' | 'breaststroke' | 'backstroke' | 'butterfly') {
+  return request<AnalysisJob>(`/api/reports/${reportId}/reanalyze`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(swimStroke ? { swimStroke } : {}) })
+}
+
 export function submitInsightFeedback(reportId: string, insightId: string, value: 'accurate' | 'inaccurate' | 'unclear' | 'not_visible' | 'not_suitable') {
   return request<{ id: string }>(`/api/reports/${reportId}/feedback`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ insightId, value }) })
 }

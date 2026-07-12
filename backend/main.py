@@ -41,12 +41,13 @@ _load_project_env(ROOT / ".env")
 
 DATA_DIR = ROOT / "backend" / "data"
 UPLOAD_DIR = DATA_DIR / "uploads"
+SOURCE_DIR = DATA_DIR / "sources"
 REPORT_DIR = DATA_DIR / "reports"
 FEEDBACK_FILE = DATA_DIR / "feedback.jsonl"
 MAX_UPLOAD_BYTES = 300 * 1024 * 1024
 PUBLIC_API_URL = os.getenv("NEVERSTOP_PUBLIC_API_URL", "http://127.0.0.1:8000").rstrip("/")
 
-for directory in (UPLOAD_DIR, REPORT_DIR):
+for directory in (UPLOAD_DIR, SOURCE_DIR, REPORT_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="NeverStop Analysis API", version="0.1.0")
@@ -89,6 +90,10 @@ class StrokeCorrection(BaseModel):
     stroke: Literal["freestyle", "breaststroke", "backstroke", "butterfly"]
 
 
+class ReanalyzeRequest(BaseModel):
+    swimStroke: Literal["freestyle", "breaststroke", "backstroke", "butterfly"] | None = None
+
+
 class ReportFeedback(BaseModel):
     insightId: str
     value: Literal["accurate", "inaccurate", "unclear", "not_visible", "not_suitable"]
@@ -105,9 +110,34 @@ def _update_job(job_id: str, **changes) -> None:
             jobs[job_id].update(changes)
 
 
+def _archived_source_path(source_hash: str) -> Path | None:
+    """按 sourceHash 找回已归档的源视频（供重新分析复用，无需重传）。"""
+    if not source_hash:
+        return None
+    matches = sorted(SOURCE_DIR.glob(f"{source_hash}.*"))
+    return matches[0] if matches else None
+
+
+def _archive_source_video(upload_path: Path, source_hash: str) -> None:
+    """分析成功后把上传视频按 sourceHash 归档去重，失败/已存在则清理临时文件。"""
+    if not source_hash or not upload_path.exists():
+        upload_path.unlink(missing_ok=True)
+        return
+    target = SOURCE_DIR / f"{source_hash}{upload_path.suffix.lower()}"
+    if target.exists():
+        upload_path.unlink(missing_ok=True)
+        return
+    try:
+        shutil.move(str(upload_path), str(target))
+    except OSError:
+        logger.exception("Failed to archive source video for %s", source_hash)
+        upload_path.unlink(missing_ok=True)
+
+
 def _process_job(job_id: str, report_id: str, upload_path: Path, file_name: str, sport: str, source_hash: str, swim_stroke_hint: str | None) -> None:
     output_path = REPORT_DIR / report_id / "evidence.jpg"
     media_url = f"{PUBLIC_API_URL}/media/{report_id}/evidence.jpg"
+    analysis_succeeded = False
 
     def progress(value: int, stage: str) -> None:
         status = "estimating_pose" if value < 82 else "building_report"
@@ -180,6 +210,7 @@ def _process_job(job_id: str, report_id: str, upload_path: Path, file_name: str,
             stage="分析完成",
             reportId=report_id,
         )
+        analysis_succeeded = True
     except AnalysisError as exc:
         _update_job(
             job_id,
@@ -200,7 +231,10 @@ def _process_job(job_id: str, report_id: str, upload_path: Path, file_name: str,
             errorMessage="分析服务出现异常，请重新尝试。",
         )
     finally:
-        upload_path.unlink(missing_ok=True)
+        if analysis_succeeded:
+            _archive_source_video(upload_path, source_hash)
+        else:
+            upload_path.unlink(missing_ok=True)
 
 
 @app.get("/api/health")
@@ -220,6 +254,7 @@ async def create_analysis_job(
     background_tasks: BackgroundTasks,
     sport: Literal["running", "swimming"] = Form(...),
     video: UploadFile = File(...),
+    swim_stroke: Literal["freestyle", "breaststroke", "backstroke", "butterfly"] | None = Form(default=None),
 ) -> dict:
     file_name = video.filename or "training-video"
     suffix = Path(file_name).suffix.lower()
@@ -252,7 +287,10 @@ async def create_analysis_job(
     source_hash = digest.hexdigest()
     with state_lock:
         same_video = next((item for item in reversed(list(reports.values())) if item.get("sourceHash") == source_hash), None)
-    swim_stroke_hint = same_video.get("swimStroke", {}).get("stroke") if same_video and sport == "swimming" else None
+    swim_stroke_hint = None
+    if sport == "swimming":
+        # 用户显式指定的泳姿优先；否则沿用同一视频历史报告的泳姿
+        swim_stroke_hint = swim_stroke or (same_video.get("swimStroke", {}).get("stroke") if same_video else None)
     job = {
         "id": job_id,
         "sport": sport,
@@ -350,6 +388,57 @@ def correct_report_stroke(report_id: str, correction: StrokeCorrection) -> dict:
         stored = dict(report)
     (REPORT_DIR / report_id / "report.json").write_text(json.dumps(stored, ensure_ascii=False, indent=2), encoding="utf-8")
     return stored
+
+
+@app.post("/api/reports/{report_id}/reanalyze", status_code=202)
+def reanalyze_report(report_id: str, request: ReanalyzeRequest, background_tasks: BackgroundTasks) -> dict:
+    """用已归档的原视频重新分析，可指定泳姿（用户修正后），无需重新上传。"""
+    with state_lock:
+        report = reports.get(report_id)
+        if not report:
+            raise HTTPException(status_code=404, detail="报告不存在。")
+        sport = report.get("sport")
+        source_hash = str(report.get("sourceHash") or "")
+        file_name = report.get("fileName") or "training-video"
+        stored_stroke = report.get("swimStroke", {}).get("stroke")
+
+    if sport not in {"running", "swimming"}:
+        raise HTTPException(status_code=400, detail="该报告不支持重新分析。")
+
+    source_path = _archived_source_path(source_hash)
+    if not source_path:
+        raise HTTPException(status_code=409, detail="原视频已不可用，请重新上传该视频后再分析。")
+
+    swim_stroke_hint: str | None = None
+    if sport == "swimming":
+        # 优先用请求显式指定的泳姿，否则沿用报告当前（可能已被用户修正的）泳姿
+        swim_stroke_hint = request.swimStroke or (stored_stroke if stored_stroke not in {None, "unknown"} else None)
+
+    new_report_id = uuid.uuid4().hex
+    job_id = uuid.uuid4().hex
+    # 复制归档视频到临时上传路径，交给现有分析流程（结束后会重新归档/清理）
+    work_path = UPLOAD_DIR / f"{job_id}{source_path.suffix.lower()}"
+    try:
+        shutil.copy2(str(source_path), str(work_path))
+    except OSError as exc:
+        logger.exception("Failed to stage archived source for reanalyze %s", report_id)
+        raise HTTPException(status_code=500, detail="准备原视频失败，请稍后重试。") from exc
+
+    job = {
+        "id": job_id,
+        "sport": sport,
+        "status": "queued",
+        "progress": 5,
+        "stage": "等待分析",
+        "reportId": None,
+        "errorCode": None,
+        "errorMessage": None,
+        "sourceHash": source_hash,
+    }
+    with state_lock:
+        jobs[job_id] = job
+    background_tasks.add_task(_process_job, job_id, new_report_id, work_path, file_name, sport, source_hash, swim_stroke_hint)
+    return job
 
 
 @app.post("/api/reports/{report_id}/feedback", status_code=201)
