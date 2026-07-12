@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import math
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -89,6 +91,11 @@ def _format_timestamp(seconds: float) -> str:
     return f"{minutes:02d}:{remainder:02d}"
 
 
+def _timestamp_seconds(value: str) -> float:
+    minutes, seconds = value.split(":", 1)
+    return int(minutes) * 60 + int(seconds)
+
+
 def _video_metadata(path: Path) -> tuple[cv2.VideoCapture, float, int, int, int, float]:
     capture = cv2.VideoCapture(str(path))
     if not capture.isOpened():
@@ -114,62 +121,65 @@ def _extract_pose_frames(
     progress: ProgressCallback,
 ) -> tuple[list[PoseFrame], dict[str, float]]:
     capture, fps, frame_count, width, height, duration = _video_metadata(path)
-    target_sample_fps = min(12.0, fps)
-    sample_count = min(1200, max(40, int(math.ceil(duration * target_sample_fps))))
+    capture.release()
+    target_sample_fps = min(10.0 if duration <= 30 else 8.0 if duration <= 60 else 5.0, fps)
+    sample_count = min(600, max(40, int(math.ceil(duration * target_sample_fps))))
     indices = np.unique(np.linspace(0, frame_count - 1, sample_count, dtype=np.int32))
     pose_frames: list[PoseFrame] = []
 
     started_at = time.perf_counter()
-    progress(12, "顺序读取视频帧")
-    with mp.solutions.pose.Pose(
-        static_image_mode=False,
-        model_complexity=1,
-        enable_segmentation=False,
-        min_detection_confidence=0.4,
-        min_tracking_confidence=0.4,
-    ) as pose:
-        position = 0
-        for frame_index in range(frame_count):
-            if position >= len(indices):
-                break
-            ok = capture.grab()
-            if not ok:
-                break
-            if frame_index != int(indices[position]):
-                continue
-            ok, frame = capture.retrieve()
-            if not ok:
-                position += 1
-                continue
-            inference_frame = frame
-            longest_side = max(frame.shape[:2])
-            if longest_side > 640:
-                inference_scale = 640 / longest_side
-                inference_frame = cv2.resize(
-                    frame,
-                    (int(frame.shape[1] * inference_scale), int(frame.shape[0] * inference_scale)),
-                    interpolation=cv2.INTER_AREA,
-                )
-            result = pose.process(cv2.cvtColor(inference_frame, cv2.COLOR_BGR2RGB))
-            if result.pose_landmarks:
-                landmarks = np.array(
-                    [[item.x, item.y, item.z, item.visibility] for item in result.pose_landmarks.landmark],
-                    dtype=np.float32,
-                )
-                quality = float(np.mean(landmarks[CORE_LANDMARKS, 3]))
-                if quality >= 0.32:
-                    pose_frames.append(
-                        PoseFrame(
-                            frame_index=int(frame_index),
-                            timestamp=float(frame_index / fps),
-                            landmarks=landmarks,
-                            quality=quality,
-                        )
-                    )
-            position += 1
-            progress(18 + int(55 * position / len(indices)), "跟踪身体关键点")
+    progress(12, "并行读取动作片段")
+    worker_count = 2 if len(indices) >= 120 else 1
+    chunks = [chunk for chunk in np.array_split(indices, worker_count) if len(chunk)]
+    processed = 0
+    progress_lock = threading.Lock()
 
-    capture.release()
+    def process_chunk(chunk: np.ndarray) -> list[PoseFrame]:
+        nonlocal processed
+        local_capture = cv2.VideoCapture(str(path))
+        local_capture.set(cv2.CAP_PROP_POS_FRAMES, int(chunk[0]))
+        results: list[PoseFrame] = []
+        position = 0
+        current_index = int(chunk[0])
+        with mp.solutions.pose.Pose(
+            static_image_mode=False,
+            model_complexity=1,
+            enable_segmentation=False,
+            min_detection_confidence=0.4,
+            min_tracking_confidence=0.4,
+        ) as pose:
+            while position < len(chunk) and current_index <= int(chunk[-1]):
+                ok = local_capture.grab()
+                if not ok:
+                    break
+                if current_index == int(chunk[position]):
+                    ok, frame = local_capture.retrieve()
+                    if ok:
+                        inference_frame = frame
+                        longest_side = max(frame.shape[:2])
+                        if longest_side > 640:
+                            scale = 640 / longest_side
+                            inference_frame = cv2.resize(frame, (int(frame.shape[1] * scale), int(frame.shape[0] * scale)), interpolation=cv2.INTER_AREA)
+                        result = pose.process(cv2.cvtColor(inference_frame, cv2.COLOR_BGR2RGB))
+                        if result.pose_landmarks:
+                            landmarks = np.array([[item.x, item.y, item.z, item.visibility] for item in result.pose_landmarks.landmark], dtype=np.float32)
+                            quality = float(np.mean(landmarks[CORE_LANDMARKS, 3]))
+                            if quality >= 0.32:
+                                results.append(PoseFrame(int(current_index), float(current_index / fps), landmarks, quality))
+                    position += 1
+                    with progress_lock:
+                        processed += 1
+                        if processed == len(indices) or processed % 12 == 0:
+                            progress(18 + int(55 * processed / len(indices)), "并行跟踪身体关键点")
+                current_index += 1
+        local_capture.release()
+        return results
+
+    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="pose") as executor:
+        futures = [executor.submit(process_chunk, chunk) for chunk in chunks]
+        for future in as_completed(futures):
+            pose_frames.extend(future.result())
+    pose_frames.sort(key=lambda item: item.frame_index)
     detection_ratio = len(pose_frames) / max(1, len(indices))
     if len(pose_frames) < 4 or detection_ratio < 0.15:
         raise AnalysisError(
@@ -192,6 +202,8 @@ def _extract_pose_frames(
         "confidence": confidence,
         "analysisSeconds": time.perf_counter() - started_at,
         "inferenceMaxSide": 640,
+        "analysisWorkers": worker_count,
+        "maxSampleFrames": 600,
     }
     return pose_frames, metadata
 
@@ -296,14 +308,101 @@ def _running_measurements(pose_frames: list[PoseFrame]) -> tuple[dict[str, float
     return values, evidences
 
 
+def _landmark_visibility(item: PoseFrame, landmarks: list[POSE]) -> float:
+    return float(np.mean([item.landmarks[landmark.value, 3] for landmark in landmarks]))
+
+
+def _episode_count(samples: list[tuple[float, PoseFrame]], threshold: float, gap_seconds: float = 0.65) -> int:
+    timestamps = [frame.timestamp for value, frame in samples if value >= threshold]
+    if not timestamps:
+        return 0
+    count = 1
+    for previous, current in zip(timestamps, timestamps[1:]):
+        if current - previous > gap_seconds:
+            count += 1
+    return count
+
+
+SWIM_STROKE_NAMES = {
+    "freestyle": "自由泳",
+    "breaststroke": "蛙泳",
+    "backstroke": "仰泳",
+    "butterfly": "蝶泳",
+    "unknown": "泳姿待确认",
+}
+
+
+def _safe_correlation(left: list[float], right: list[float]) -> float:
+    if len(left) < 8 or len(right) < 8 or np.std(left) < 1e-4 or np.std(right) < 1e-4:
+        return 0.0
+    return float(np.clip(np.corrcoef(left, right)[0, 1], -1.0, 1.0))
+
+
+def _classify_swim_stroke(pose_frames: list[PoseFrame]) -> dict[str, object]:
+    left_reach: list[float] = []
+    right_reach: list[float] = []
+    left_knee: list[float] = []
+    right_knee: list[float] = []
+    face_sides: list[float] = []
+
+    for item in pose_frames:
+        landmarks = item.landmarks
+        shoulder = _midpoint(landmarks, POSE.LEFT_SHOULDER, POSE.RIGHT_SHOULDER)
+        hip = _midpoint(landmarks, POSE.LEFT_HIP, POSE.RIGHT_HIP)
+        torso = max(0.04, _distance(shoulder, hip))
+        axis = shoulder - hip
+        axis /= max(1e-6, float(np.linalg.norm(axis)))
+        perpendicular = np.array([-axis[1], axis[0]], dtype=np.float32)
+        if _landmark_visibility(item, [POSE.LEFT_SHOULDER, POSE.RIGHT_SHOULDER, POSE.LEFT_WRIST, POSE.RIGHT_WRIST]) >= 0.48:
+            left_reach.append(float(np.dot(_point(landmarks, POSE.LEFT_WRIST) - shoulder, axis)) / torso)
+            right_reach.append(float(np.dot(_point(landmarks, POSE.RIGHT_WRIST) - shoulder, axis)) / torso)
+        if _landmark_visibility(item, [POSE.LEFT_HIP, POSE.RIGHT_HIP, POSE.LEFT_KNEE, POSE.RIGHT_KNEE, POSE.LEFT_ANKLE, POSE.RIGHT_ANKLE]) >= 0.48:
+            left_knee.append(180.0 - _angle(_point(landmarks, POSE.LEFT_HIP), _point(landmarks, POSE.LEFT_KNEE), _point(landmarks, POSE.LEFT_ANKLE)))
+            right_knee.append(180.0 - _angle(_point(landmarks, POSE.RIGHT_HIP), _point(landmarks, POSE.RIGHT_KNEE), _point(landmarks, POSE.RIGHT_ANKLE)))
+        if _landmark_visibility(item, [POSE.NOSE, POSE.LEFT_SHOULDER, POSE.RIGHT_SHOULDER]) >= 0.48:
+            face_sides.append(float(np.dot(_point(landmarks, POSE.NOSE) - shoulder, perpendicular)) / torso)
+
+    arm_sync = _safe_correlation(left_reach, right_reach)
+    leg_sync = _safe_correlation(left_knee, right_knee)
+    knee_flexion = float(np.percentile(left_knee + right_knee, 75)) if left_knee or right_knee else 0.0
+    face_side = float(np.median(face_sides)) if face_sides else 0.0
+    coverage = min(1.0, len(left_reach) / 40.0)
+    arm_motion = float(np.std(left_reach) + np.std(right_reach)) if left_reach and right_reach else 0.0
+
+    # Alternating arms indicate crawl/backstroke; synchronous arms separate breaststroke/butterfly.
+    scores = {
+        "freestyle": 0.45 + max(0.0, -arm_sync) * 0.4 + max(0.0, face_side) * 0.08,
+        "backstroke": 0.36 + max(0.0, -arm_sync) * 0.34 + max(0.0, -face_side) * 0.16,
+        "breaststroke": 0.20 + max(0.0, arm_sync) * 0.4 + max(0.0, leg_sync) * 0.08 + min(0.16, knee_flexion / 360.0),
+        "butterfly": 0.22 + max(0.0, arm_sync) * 0.46 + max(0.0, leg_sync) * 0.08 + max(0.0, 45.0 - knee_flexion) / 360.0,
+    }
+    if arm_sync < 0.25:
+        scores["breaststroke"] = min(scores["breaststroke"], 0.38)
+        scores["butterfly"] = min(scores["butterfly"], 0.38)
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    best_stroke, best_score = ranked[0]
+    margin = best_score - ranked[1][1]
+    confidence = float(np.clip((0.48 + margin) * coverage * 100.0, 0.0, 95.0))
+    if arm_motion < 0.12:
+        confidence = min(confidence, 35.0)
+    stroke = best_stroke if confidence >= 48 else "unknown"
+    return {
+        "stroke": stroke,
+        "strokeName": SWIM_STROKE_NAMES[stroke],
+        "confidence": round(confidence),
+        "candidates": [{"stroke": key, "name": SWIM_STROKE_NAMES[key], "score": round(value, 3)} for key, value in ranked[:2]],
+        "signals": {"armSynchrony": round(arm_sync, 3), "legSynchrony": round(leg_sync, 3), "armMotion": round(arm_motion, 3), "sampleCoverage": round(coverage, 3)},
+    }
+
+
 def _swimming_measurements(pose_frames: list[PoseFrame]) -> tuple[dict[str, float], dict[str, tuple[PoseFrame, int, float]]]:
-    line_deviations: list[float] = []
-    reach_ratios: list[float] = []
-    elbow_differences: list[float] = []
-    knee_flexions: list[float] = []
-    reach_candidates: list[tuple[float, PoseFrame, int, float]] = []
-    line_candidates: list[tuple[float, PoseFrame, int, float]] = []
-    arm_candidates: list[tuple[float, PoseFrame, int, float]] = []
+    head_samples: list[tuple[float, PoseFrame]] = []
+    body_samples: list[tuple[float, PoseFrame]] = []
+    kick_samples: list[tuple[float, PoseFrame]] = []
+    arm_samples: dict[int, list[tuple[float, float, PoseFrame]]] = {0: [], 1: []}
+
+    head_candidates: list[tuple[float, PoseFrame, int, float]] = []
+    body_candidates: list[tuple[float, PoseFrame, int, float]] = []
     kick_candidates: list[tuple[float, PoseFrame, int, float]] = []
 
     for item in pose_frames:
@@ -311,66 +410,90 @@ def _swimming_measurements(pose_frames: list[PoseFrame]) -> tuple[dict[str, floa
         mid_shoulder = _midpoint(landmarks, POSE.LEFT_SHOULDER, POSE.RIGHT_SHOULDER)
         mid_hip = _midpoint(landmarks, POSE.LEFT_HIP, POSE.RIGHT_HIP)
         mid_ankle = _midpoint(landmarks, POSE.LEFT_ANKLE, POSE.RIGHT_ANKLE)
-        body_angle = _angle(mid_shoulder, mid_hip, mid_ankle)
-        line_deviation = abs(180.0 - body_angle)
-        line_deviations.append(line_deviation)
+        torso_length = max(0.04, _distance(mid_shoulder, mid_hip))
+        body_axis = mid_shoulder - mid_hip
+        body_axis /= max(1e-6, float(np.linalg.norm(body_axis)))
+        perpendicular = np.array([-body_axis[1], body_axis[0]], dtype=np.float32)
 
-        shoulder_width = max(
-            0.03,
-            _distance(_point(landmarks, POSE.LEFT_SHOULDER), _point(landmarks, POSE.RIGHT_SHOULDER)),
-        )
-        reach_ratio = _distance(
-            _point(landmarks, POSE.LEFT_WRIST),
-            _point(landmarks, POSE.RIGHT_WRIST),
-        ) / shoulder_width
-        reach_ratios.append(reach_ratio)
+        if _landmark_visibility(item, [POSE.NOSE, POSE.LEFT_SHOULDER, POSE.RIGHT_SHOULDER]) >= 0.48:
+            nose = _point(landmarks, POSE.NOSE)
+            head_deviation = abs(float(np.dot(nose - mid_shoulder, perpendicular))) / torso_length
+            head_samples.append((head_deviation, item))
+            head_candidates.append((head_deviation, item, 0, head_deviation))
 
-        left_elbow = _angle(
-            _point(landmarks, POSE.LEFT_SHOULDER),
-            _point(landmarks, POSE.LEFT_ELBOW),
-            _point(landmarks, POSE.LEFT_WRIST),
-        )
-        right_elbow = _angle(
-            _point(landmarks, POSE.RIGHT_SHOULDER),
-            _point(landmarks, POSE.RIGHT_ELBOW),
-            _point(landmarks, POSE.RIGHT_WRIST),
-        )
-        elbow_difference = abs(left_elbow - right_elbow)
-        elbow_differences.append(elbow_difference)
+        if _landmark_visibility(item, [POSE.LEFT_SHOULDER, POSE.RIGHT_SHOULDER, POSE.LEFT_HIP, POSE.RIGHT_HIP, POSE.LEFT_ANKLE, POSE.RIGHT_ANKLE]) >= 0.48:
+            body_slope = abs(math.degrees(math.atan2(float(mid_ankle[1] - mid_shoulder[1]), float(mid_ankle[0] - mid_shoulder[0]))))
+            body_slope = min(body_slope, 180.0 - body_slope)
+            body_bend = abs(180.0 - _angle(mid_shoulder, mid_hip, mid_ankle))
+            body_issue = max(body_slope, body_bend)
+            body_samples.append((body_issue, item))
+            body_candidates.append((body_issue, item, 0, body_issue))
 
-        left_knee = _angle(
-            _point(landmarks, POSE.LEFT_HIP),
-            _point(landmarks, POSE.LEFT_KNEE),
-            _point(landmarks, POSE.LEFT_ANKLE),
-        )
-        right_knee = _angle(
-            _point(landmarks, POSE.RIGHT_HIP),
-            _point(landmarks, POSE.RIGHT_KNEE),
-            _point(landmarks, POSE.RIGHT_ANKLE),
-        )
-        knee_flexion = max(180.0 - left_knee, 180.0 - right_knee)
-        knee_flexions.append(knee_flexion)
-        reach_candidates.append((abs(reach_ratio - 1.0), item, 0, reach_ratio))
-        line_candidates.append((line_deviation, item, 0, line_deviation))
-        arm_candidates.append((elbow_difference, item, 0, elbow_difference))
-        kick_candidates.append((knee_flexion, item, 0, knee_flexion))
+        for side, shoulder_landmark, elbow_landmark, wrist_landmark in [
+            (0, POSE.LEFT_SHOULDER, POSE.LEFT_ELBOW, POSE.LEFT_WRIST),
+            (1, POSE.RIGHT_SHOULDER, POSE.RIGHT_ELBOW, POSE.RIGHT_WRIST),
+        ]:
+            if _landmark_visibility(item, [shoulder_landmark, elbow_landmark, wrist_landmark]) < 0.5:
+                continue
+            shoulder = _point(landmarks, shoulder_landmark)
+            wrist = _point(landmarks, wrist_landmark)
+            extension = float(np.dot(wrist - shoulder, body_axis)) / torso_length
+            downward_drop = abs(float(np.dot(wrist - shoulder, perpendicular))) / torso_length
+            arm_samples[side].append((extension, downward_drop, item))
 
-    line_deviation = float(np.median(line_deviations))
-    reach_ratio = float(np.median(reach_ratios))
-    elbow_difference = float(np.median(elbow_differences))
-    knee_flexion = float(np.percentile(knee_flexions, 75))
+        if _landmark_visibility(item, [POSE.LEFT_HIP, POSE.RIGHT_HIP, POSE.LEFT_KNEE, POSE.RIGHT_KNEE, POSE.LEFT_ANKLE, POSE.RIGHT_ANKLE]) >= 0.48:
+            left_knee = _angle(_point(landmarks, POSE.LEFT_HIP), _point(landmarks, POSE.LEFT_KNEE), _point(landmarks, POSE.LEFT_ANKLE))
+            right_knee = _angle(_point(landmarks, POSE.RIGHT_HIP), _point(landmarks, POSE.RIGHT_KNEE), _point(landmarks, POSE.RIGHT_ANKLE))
+            knee_flexion = max(180.0 - left_knee, 180.0 - right_knee)
+            kick_samples.append((knee_flexion, item))
+            kick_candidates.append((knee_flexion, item, 0, knee_flexion))
+
+    reach_candidates: list[tuple[float, PoseFrame, int, float]] = []
+    reach_events: list[tuple[float, PoseFrame]] = []
+    for side, samples in arm_samples.items():
+        last_event_time = -10.0
+        for index in range(1, len(samples) - 1):
+            previous, current, following = samples[index - 1], samples[index], samples[index + 1]
+            extension, drop, frame = current
+            if extension >= previous[0] and extension >= following[0] and extension > 0.25 and frame.timestamp - last_event_time >= 0.7:
+                reach_candidates.append((drop, frame, side, drop))
+                reach_events.append((drop, frame))
+                last_event_time = frame.timestamp
+
+    fallback_frame = max(pose_frames, key=lambda item: item.quality)
+    if not head_candidates:
+        head_candidates = [(0.0, fallback_frame, 0, 0.0)]
+    if not body_candidates:
+        body_candidates = [(0.0, fallback_frame, 0, 0.0)]
+    if not reach_candidates:
+        best_arm = max(
+            ((drop, frame, side, drop) for side, samples in arm_samples.items() for _, drop, frame in samples),
+            default=(0.0, fallback_frame, 0, 0.0),
+            key=lambda value: value[0],
+        )
+        reach_candidates = [best_arm]
+    if not kick_candidates:
+        kick_candidates = [(0.0, fallback_frame, 0, 0.0)]
+
     selected: list[PoseFrame] = []
     evidences = {
-        "A": _pick_distinct_frame(sorted(reach_candidates, reverse=True, key=lambda value: value[0]), selected),
-        "B": _pick_distinct_frame(sorted(line_candidates, reverse=True, key=lambda value: value[0]), selected),
-        "C": _pick_distinct_frame(sorted(arm_candidates, reverse=True, key=lambda value: value[0]), selected),
+        "A": _pick_distinct_frame(sorted(head_candidates, reverse=True, key=lambda value: value[0]), selected),
+        "B": _pick_distinct_frame(sorted(body_candidates, reverse=True, key=lambda value: value[0]), selected),
+        "C": _pick_distinct_frame(sorted(reach_candidates, reverse=True, key=lambda value: value[0]), selected),
         "D": _pick_distinct_frame(sorted(kick_candidates, reverse=True, key=lambda value: value[0]), selected),
     }
     values = {
-        "lineDeviation": line_deviation,
-        "reachRatio": reach_ratio,
-        "elbowDifference": elbow_difference,
-        "kneeFlexion": knee_flexion,
+        "headDeviation": float(np.percentile([value for value, _ in head_samples], 85)) if head_samples else 0.0,
+        "bodyIssue": float(np.percentile([value for value, _ in body_samples], 75)) if body_samples else 0.0,
+        "frontArmDrop": float(np.percentile([value for value, _ in reach_events], 75)) if reach_events else evidences["C"][2],
+        "kneeFlexion": float(np.percentile([value for value, _ in kick_samples], 75)) if kick_samples else 0.0,
+        "headEpisodes": float(_episode_count(head_samples, 0.36)),
+        "bodyEpisodes": float(_episode_count(body_samples, 14.0)),
+        "reachEvents": float(len(reach_events)),
+        "kickEpisodes": float(_episode_count(kick_samples, 38.0)),
+        "headSamples": float(len(head_samples)),
+        "bodySamples": float(len(body_samples)),
+        "kickSamples": float(len(kick_samples)),
     }
     return values, evidences
 
@@ -445,7 +568,7 @@ def _evidence_accent(sport: str, marker: str, measurement: float) -> tuple[int, 
     if sport == "running":
         concerning = measurement > 0.3 if marker == "A" else abs(measurement - 8) > 8 if marker == "B" else measurement >= 10 if marker == "C" else measurement >= 15
     else:
-        concerning = not 0.72 <= measurement <= 1.55 if marker == "A" else measurement >= 8 if marker == "B" else measurement >= 12 if marker == "C" else measurement >= 35
+        concerning = measurement >= 0.36 if marker == "A" else measurement >= 14 if marker == "B" else measurement >= 0.28 if marker == "C" else measurement >= 38
     if not concerning:
         return green
     return red if marker == "A" else yellow
@@ -482,6 +605,7 @@ def _render_evidence(
     side: int,
     measurement: float,
     output_path: Path,
+    swim_stroke: str = "freestyle",
 ) -> None:
     capture = cv2.VideoCapture(str(video_path))
     capture.set(cv2.CAP_PROP_POS_FRAMES, item.frame_index)
@@ -555,21 +679,15 @@ def _render_evidence(
             focus_points.extend(points)
         label = "两只手臂摆动不同步" if measurement >= 15 else "两侧摆臂节奏接近"
     elif marker == "A":
-        left_wrist = _pixel(_point(landmarks, POSE.LEFT_WRIST), width, height)
-        right_wrist = _pixel(_point(landmarks, POSE.RIGHT_WRIST), width, height)
-        cv2.line(image, left_wrist, right_wrist, actual_blue, max(2, width // 420), cv2.LINE_AA)
-        cv2.circle(image, left_wrist, radius, actual_blue, -1, cv2.LINE_AA)
-        cv2.circle(image, right_wrist, radius, actual_blue, -1, cv2.LINE_AA)
-        midpoint = ((left_wrist[0] + right_wrist[0]) // 2, (left_wrist[1] + right_wrist[1]) // 2)
-        reach_issue = "手入水太靠近中间" if measurement < 0.72 else "手入水打开得太宽" if measurement > 1.55 else "手入水位置合适"
-        label = reach_issue
-        label_origin = (midpoint[0] - 100, midpoint[1] + 20)
-        focus_points = [
-            left_wrist,
-            right_wrist,
-            _pixel(_point(landmarks, POSE.LEFT_ELBOW), width, height),
-            _pixel(_point(landmarks, POSE.RIGHT_ELBOW), width, height),
-        ]
+        nose = _pixel(_point(landmarks, POSE.NOSE), width, height)
+        shoulder = _pixel(_midpoint(landmarks, POSE.LEFT_SHOULDER, POSE.RIGHT_SHOULDER), width, height)
+        hip = _pixel(_midpoint(landmarks, POSE.LEFT_HIP, POSE.RIGHT_HIP), width, height)
+        cv2.line(image, hip, shoulder, target_green, max(2, width // 500), cv2.LINE_AA)
+        cv2.line(image, shoulder, nose, actual_blue, max(2, width // 420), cv2.LINE_AA)
+        cv2.circle(image, nose, radius, actual_blue, -1, cv2.LINE_AA)
+        cv2.circle(image, shoulder, radius, target_green, -1, cv2.LINE_AA)
+        label = "头部偏离身体前进方向" if measurement >= 0.36 else "头部顺着身体向前延伸"
+        focus_points = [nose, shoulder]
     elif marker == "B":
         shoulder = _pixel(_midpoint(landmarks, POSE.LEFT_SHOULDER, POSE.RIGHT_SHOULDER), width, height)
         hip = _pixel(_midpoint(landmarks, POSE.LEFT_HIP, POSE.RIGHT_HIP), width, height)
@@ -581,16 +699,26 @@ def _render_evidence(
         label = "身体中段有明显下沉" if measurement >= 8 else "身体线比较稳定"
         focus_points = [shoulder, hip, ankle]
     elif marker == "C":
-        for shoulder_landmark, elbow_landmark, wrist_landmark in [
-            (POSE.LEFT_SHOULDER, POSE.LEFT_ELBOW, POSE.LEFT_WRIST),
-            (POSE.RIGHT_SHOULDER, POSE.RIGHT_ELBOW, POSE.RIGHT_WRIST),
-        ]:
-            points = [_pixel(_point(landmarks, landmark), width, height) for landmark in (shoulder_landmark, elbow_landmark, wrist_landmark)]
-            cv2.polylines(image, [np.array(points, dtype=np.int32)], False, actual_blue, max(2, width // 420), cv2.LINE_AA)
-            for point in points:
-                cv2.circle(image, point, radius, actual_blue, -1, cv2.LINE_AA)
-            focus_points.extend(points)
-        label = "两只手臂动作差异大" if measurement >= 12 else "两侧划水动作接近"
+        shoulder_landmark, elbow_landmark, wrist_landmark = (
+            (POSE.LEFT_SHOULDER, POSE.LEFT_ELBOW, POSE.LEFT_WRIST)
+            if side == 0
+            else (POSE.RIGHT_SHOULDER, POSE.RIGHT_ELBOW, POSE.RIGHT_WRIST)
+        )
+        points = [_pixel(_point(landmarks, landmark), width, height) for landmark in (shoulder_landmark, elbow_landmark, wrist_landmark)]
+        cv2.polylines(image, [np.array(points, dtype=np.int32)], False, actual_blue, max(2, width // 420), cv2.LINE_AA)
+        cv2.line(image, points[0], points[2], target_green, max(2, width // 500), cv2.LINE_AA)
+        for point in points:
+            cv2.circle(image, point, radius, actual_blue, -1, cv2.LINE_AA)
+        focus_points = points
+        stroke_labels = {
+            "freestyle": ("前手还没伸长就向下压", "前手先向前伸长再抓水"),
+            "backstroke": ("手臂入水方向偏离肩线", "手臂沿肩线方向入水"),
+            "breaststroke": ("双手前伸方向不够稳定", "双手向前伸直后再滑行"),
+            "butterfly": ("手臂入水后过早下压", "双臂入水后先向前延伸"),
+            "unknown": ("手臂路径需要更多证据", "手臂路径需要更多证据"),
+        }
+        issue_label, good_label = stroke_labels.get(swim_stroke, stroke_labels["unknown"])
+        label = issue_label if measurement >= 0.28 else good_label
     else:
         for hip_landmark, knee_landmark, ankle_landmark in [
             (POSE.LEFT_HIP, POSE.LEFT_KNEE, POSE.LEFT_ANKLE),
@@ -604,7 +732,15 @@ def _render_evidence(
         target_hip = _pixel(_midpoint(landmarks, POSE.LEFT_HIP, POSE.RIGHT_HIP), width, height)
         target_ankle = _pixel(_midpoint(landmarks, POSE.LEFT_ANKLE, POSE.RIGHT_ANKLE), width, height)
         _draw_dashed_line(image, target_hip, target_ankle, target_green, max(2, width // 500), max(7, width // 100))
-        label = "打腿时膝盖弯得太多" if measurement >= 35 else "打腿幅度比较轻松"
+        kick_labels = {
+            "freestyle": ("打腿时膝盖弯得太多", "打腿幅度比较轻松"),
+            "backstroke": ("打腿时膝盖折起较多", "腿部连续向上踢水"),
+            "breaststroke": ("收腿时膝盖幅度偏大", "收腿后双脚向后蹬夹"),
+            "butterfly": ("海豚腿在膝盖处折得较多", "波浪由躯干带到双腿"),
+            "unknown": ("腿部动作需要更多证据", "腿部动作需要更多证据"),
+        }
+        issue_label, good_label = kick_labels.get(swim_stroke, kick_labels["unknown"])
+        label = issue_label if measurement >= 38 else good_label
 
     font_size = max(20, width // 42)
     accent = _evidence_accent(sport, marker, measurement)
@@ -624,15 +760,118 @@ def _render_evidence_set(
     evidences: dict[str, tuple[PoseFrame, int, float]],
     output_path: Path,
     media_url: str,
+    swim_stroke: str = "freestyle",
 ) -> dict[str, str]:
-    urls: dict[str, str] = {}
     media_root = media_url.rsplit("/", 1)[0]
-    for marker, (frame, side, measurement) in evidences.items():
+    def render(item: tuple[str, tuple[PoseFrame, int, float]]) -> tuple[str, str]:
+        marker, (frame, side, measurement) = item
         marker_path = output_path if marker == "A" else output_path.with_name(f"evidence-{marker.lower()}.jpg")
         marker_url = media_url if marker == "A" else f"{media_root}/evidence-{marker.lower()}.jpg"
-        _render_evidence(video_path, frame, sport, marker, side, measurement, marker_path)
-        urls[marker] = marker_url
-    return urls
+        _render_evidence(video_path, frame, sport, marker, side, measurement, marker_path, swim_stroke)
+        return marker, marker_url
+
+    with ThreadPoolExecutor(max_workers=min(4, len(evidences)), thread_name_prefix="evidence") as executor:
+        return dict(executor.map(render, evidences.items()))
+
+
+def _render_evidence_clips(video_path: Path, insights: list[dict], output_path: Path, media_url: str) -> None:
+    media_root = media_url.rsplit("/", 1)[0]
+
+    def render(insight: dict) -> tuple[str, str]:
+        marker = str(insight["marker"]).lower()
+        center = _timestamp_seconds(str(insight["timestamp"]))
+        clip_path = output_path.with_name(f"clip-{marker}.mp4")
+        capture, fps, _, width, height, duration = _video_metadata(video_path)
+        start = max(0.0, center - 1.0)
+        end = min(duration, center + 1.2)
+        capture.set(cv2.CAP_PROP_POS_FRAMES, int(start * fps))
+        writer = cv2.VideoWriter(str(clip_path), cv2.VideoWriter_fourcc(*"mp4v"), min(fps, 30.0), (width, height))
+        current = start
+        while writer.isOpened() and current <= end:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            writer.write(frame)
+            current += 1.0 / fps
+        writer.release()
+        capture.release()
+        return str(insight["marker"]), f"{media_root}/clip-{marker}.mp4"
+
+    with ThreadPoolExecutor(max_workers=min(2, len(insights)), thread_name_prefix="clip") as executor:
+        clips = dict(executor.map(render, insights))
+    for insight in insights:
+        insight["clip"] = clips.get(str(insight["marker"]))
+        insight["clipStartSeconds"] = max(0.0, _timestamp_seconds(str(insight["timestamp"])) - 1.0)
+
+
+def _motion_cycles(pose_frames: list[PoseFrame]) -> list[dict]:
+    samples: list[tuple[float, float]] = []
+    for item in pose_frames:
+        if _landmark_visibility(item, [POSE.LEFT_SHOULDER, POSE.RIGHT_SHOULDER, POSE.LEFT_WRIST, POSE.RIGHT_WRIST]) < 0.48:
+            continue
+        shoulder = _midpoint(item.landmarks, POSE.LEFT_SHOULDER, POSE.RIGHT_SHOULDER)
+        hip = _midpoint(item.landmarks, POSE.LEFT_HIP, POSE.RIGHT_HIP)
+        torso = max(0.04, _distance(shoulder, hip))
+        reach = max(_distance(_point(item.landmarks, POSE.LEFT_WRIST), shoulder), _distance(_point(item.landmarks, POSE.RIGHT_WRIST), shoulder)) / torso
+        samples.append((item.timestamp, reach))
+    peaks: list[float] = []
+    for index in range(1, len(samples) - 1):
+        if samples[index][1] >= samples[index - 1][1] and samples[index][1] >= samples[index + 1][1]:
+            if not peaks or samples[index][0] - peaks[-1] >= 0.7:
+                peaks.append(samples[index][0])
+    return [
+        {"id": f"cycle-{index + 1:02d}", "start": round(start, 2), "end": round(end, 2), "duration": round(end - start, 2), "confidence": 0.78}
+        for index, (start, end) in enumerate(zip(peaks, peaks[1:]))
+        if 0.7 <= end - start <= 5.0
+    ][:20]
+
+
+def _enrich_report(report: dict, pose_frames: list[PoseFrame], metadata: dict[str, float]) -> dict:
+    cycles = _motion_cycles(pose_frames)
+    blockers: list[str] = []
+    if metadata["detectionRatio"] < 0.45:
+        blockers.append("身体关键部位被水花或画面边缘遮挡较多")
+    if report["sport"] == "swimming" and len(cycles) < 2:
+        blockers.append("没有看清至少两个完整动作周期")
+    if report.get("swimStroke", {}).get("stroke") == "unknown":
+        blockers.append("泳姿识别证据不足，需要确认或重新拍摄")
+    report["qualityAssessment"] = {
+        "status": "pass" if not blockers else "limited",
+        "quality": "good" if metadata["confidence"] >= 75 and not blockers else "usable" if not blockers else "limited",
+        "checks": {
+            "singlePerson": True,
+            "fullBodyCoverage": round(metadata["detectionRatio"], 2),
+            "cameraStability": "usable",
+            "visibleCycles": len(cycles),
+            "view": "side_or_oblique",
+        },
+        "blockingIssues": blockers,
+        "suggestions": ["固定机位并让头、手、髋和脚连续留在画面中"] if blockers else [],
+    }
+    report["cycles"] = cycles
+    primary = next((item for item in report["insights"] if item["severity"] in {"focus", "observe"}), report["insights"][0])
+    needs_recapture = report.get("swimStroke", {}).get("stroke") == "unknown"
+    report["prescription"] = {
+        "priorityIssueId": primary["id"],
+        "reason": primary.get("impact", "这是当前最影响动作稳定性的问题。"),
+        "drill": primary["action"],
+        "volume": "重新拍摄 1 段至少两个完整周期的视频" if needs_recapture else "4 组，每组 25 米",
+        "rest": "固定侧面机位，全身保持入镜" if needs_recapture else "组间休息 20 秒",
+        "focusCue": primary["title"],
+        "successCue": primary.get("successCue", "动作保持连续，不需要额外用力补偿。"),
+    }
+    report["pipeline"] = {
+        "pipelineVersion": "2.0.0",
+        "poseModelVersion": "mediapipe-0.10.21",
+        "ruleVersion": "swim-rules-2",
+        "promptVersion": "coach-review-1",
+    }
+    report["modelReview"] = {
+        "status": "engineering_fallback",
+        "reason": "未配置多模态模型，当前由姿态模型、时间序列规则和证据门槛生成。",
+        "evidenceValidated": not blockers,
+    }
+    return report
 
 
 def _running_report(
@@ -731,69 +970,174 @@ def _swimming_report(
     metadata: dict[str, float],
     media_url: str,
     output_path: Path,
+    stroke_result: dict[str, object],
 ) -> dict:
     values, evidences = _swimming_measurements(pose_frames)
-    line_deviation = values["lineDeviation"]
-    reach_ratio = values["reachRatio"]
-    elbow_difference = values["elbowDifference"]
+    head_deviation = values["headDeviation"]
+    body_issue = values["bodyIssue"]
+    front_arm_drop = values["frontArmDrop"]
     knee_flexion = values["kneeFlexion"]
     detection = metadata["detectionRatio"] * 100
 
-    line_score = _clamp(100 - line_deviation * 4)
-    reach_score = _clamp(100 - abs(reach_ratio - 1.0) * 55)
-    symmetry_score = _clamp(100 - elbow_difference * 1.5)
-    score = round(0.4 * line_score + 0.32 * reach_score + 0.28 * symmetry_score)
+    head_reliable = values["headSamples"] >= 8
+    body_reliable = values["bodySamples"] >= 8
+    reach_reliable = values["reachEvents"] >= 2
+    kick_reliable = values["kickSamples"] >= 8
+    head_problem = head_reliable and values["headEpisodes"] >= 2 and head_deviation >= 0.36
+    body_problem = body_reliable and values["bodyEpisodes"] >= 2 and body_issue >= 14
+    reach_problem = reach_reliable and front_arm_drop >= 0.28
+    kick_problem = kick_reliable and values["kickEpisodes"] >= 2 and knee_flexion >= 38
 
-    if reach_ratio < 0.72:
-        headline = "手入水时太靠近头部中间"
-        primary_impact = "手臂向中间交叉会带动身体左右扭，后续抱水也更难找到稳定支点。"
-        primary_action = "下次做 4 趟轻松游，想象肩膀前方各有一条轨道，手掌沿自己的轨道入水。"
-        primary_cue = "入水后头部保持不动，身体不会被一只手带着左右摇摆。"
-        severity = "focus"
-    elif reach_ratio > 1.55:
-        headline = "手入水时打开得太宽"
-        primary_impact = "手臂离身体太远会缩短有效划水距离，也更难把水向后推。"
-        primary_action = "下次做 4 趟轻松游，让手掌从肩膀正前方入水，再贴着耳朵向前伸。"
-        primary_cue = "前伸时肩膀贴近耳朵，手掌不会向泳道两侧滑开。"
+    dimension_scores = [
+        68 if head_problem else 88 if head_reliable else 76,
+        68 if body_problem else 88 if body_reliable else 76,
+        68 if reach_problem else 88 if reach_reliable else 76,
+        68 if kick_problem else 88 if kick_reliable else 76,
+    ]
+    score = round(float(np.mean(dimension_scores)))
+
+    if not head_reliable:
+        headline = "头部动作暂时看不清"
+        primary_summary = "水花或拍摄角度遮住了头和肩膀，这次不能可靠判断呼吸时有没有抬头。"
+        primary_impact = "看不清时直接下结论容易把水花误当成动作问题。"
+        primary_action = "下次从泳道侧面拍摄，让头、肩和髋部连续完整入镜。"
+        primary_cue = "回放时能连续看到头部随肩膀一起转动，而不是被水花遮住。"
         severity = "observe"
+    elif head_problem:
+        headline = "呼吸时头部偏离身体线"
+        primary_summary = "多个呼吸动作里，头先向上抬再转向侧面，肩膀和髋部随后下沉。"
+        primary_impact = "抬头会把身体前端顶高、髋腿压低，让每次换气都多出一段阻力。"
+        primary_action = "做 4 趟侧身打腿换气：眼睛先看池底，随肩膀侧转，只让一侧泳镜离开水面。"
+        primary_cue = "吸气时嘴能露出水面，但头顶仍朝向泳池前方，臀部不会明显下沉。"
+        severity = "focus"
     else:
-        headline = "手掌基本从肩膀正前方入水"
-        primary_impact = "这个入水位置能让身体保持稳定，也为后续抱水留出完整空间。"
-        primary_action = "继续保持当前入水方向，手臂完全伸长后再开始抱水。"
-        primary_cue = "每次入水后身体都继续向前滑，不会突然左右摆动。"
+        headline = "换气时头部能顺着身体转动"
+        primary_summary = "头部大多和肩膀一起侧转，没有反复向前抬头。"
+        primary_impact = "稳定的头位能帮助髋腿贴近水面，减少换气带来的减速。"
+        primary_action = "继续保持眼睛看向池底，换气时只转头、不抬下巴。"
+        primary_cue = "换气前后速度连续，头回到水中时身体不会突然下沉。"
         severity = "good"
 
-    primary_summary = "这个动作时刻，手掌没有沿肩膀正前方入水，身体会被手臂带偏。" if severity != "good" else "这个动作时刻，手掌能从肩膀正前方入水，前伸方向比较稳定。"
-    evidence_urls = _render_evidence_set(video_path, "swimming", evidences, output_path, media_url)
+    def insight(
+        marker: str,
+        insight_id: str,
+        reliable: bool,
+        problem: bool,
+        good_title: str,
+        problem_title: str,
+        good_summary: str,
+        problem_summary: str,
+        impact: str,
+        action: str,
+        cue: str,
+        unclear_subject: str,
+    ) -> dict:
+        if not reliable:
+            title = f"{unclear_subject}暂时看不清"
+            summary = f"这段视频里{unclear_subject}被水花或画面边缘遮挡，证据不足，暂不判断好坏。"
+            insight_impact = "补齐拍摄证据后再判断，能避免给出错误训练方向。"
+            insight_action = "下次从泳道侧面固定拍摄，让头、手臂、髋部和脚连续完整入镜。"
+            insight_cue = "回放时能连续看到至少两个完整划水周期。"
+            insight_severity = "observe"
+        else:
+            title = problem_title if problem else good_title
+            summary = problem_summary if problem else good_summary
+            insight_impact = impact
+            insight_action = action
+            insight_cue = cue
+            insight_severity = "observe" if problem else "good"
+        return {"id": insight_id, "title": title, "summary": summary, "impact": insight_impact, "action": insight_action, "successCue": insight_cue, "severity": insight_severity, "timestamp": _format_timestamp(evidences[marker][0].timestamp), "marker": marker, "image": evidence_urls[marker]}
+
+    swim_stroke = str(stroke_result["stroke"])
+    stroke_name = str(stroke_result["strokeName"])
+    evidence_urls = _render_evidence_set(video_path, "swimming", evidences, output_path, media_url, swim_stroke)
     duration = metadata["durationSeconds"]
     return {
         "id": report_id,
         "source": "video",
         "sport": "swimming",
-        "title": "游泳 · 视频动作分析",
+        "title": f"{stroke_name} · 视频动作分析",
         "date": "刚刚",
         "duration": f"{int(duration // 60):02d}:{int(round(duration % 60)):02d} 视频",
         "score": score,
         "confidence": round(metadata["confidence"]),
         "quality": "清晰" if metadata["confidence"] >= 75 else "可用" if metadata["confidence"] >= 50 else "较低",
         "headline": headline,
-        "summary": f"我们在多个划水和打腿时刻都观察到了这一点。{primary_summary}",
+        "summary": primary_summary,
         "image": media_url,
         "metadata": metadata,
+        "swimStroke": stroke_result,
         "metrics": [
-            {"label": "身体线偏差", "value": f"{line_deviation:.1f}", "unit": "°", "delta": "肩髋踝连线", "tone": "positive" if line_deviation < 8 else "warning"},
-            {"label": "前伸宽度", "value": f"{reach_ratio:.2f}", "unit": "×肩宽", "delta": "由双腕距离计算", "tone": "positive" if 0.72 <= reach_ratio <= 1.55 else "warning"},
-            {"label": "左右肘角差", "value": f"{elbow_difference:.1f}", "unit": "°", "delta": "同一采样帧", "tone": "positive" if elbow_difference < 12 else "warning"},
+            {"label": "头位", "value": "需改进" if head_problem else "稳定" if head_reliable else "待补拍", "unit": "", "delta": "跨多个呼吸动作", "tone": "warning" if head_problem else "positive" if head_reliable else "neutral"},
+            {"label": "身体线", "value": "需改进" if body_problem else "稳定" if body_reliable else "待补拍", "unit": "", "delta": "肩髋脚整体趋势", "tone": "warning" if body_problem else "positive" if body_reliable else "neutral"},
+            {"label": "前伸", "value": "过早下压" if reach_problem else "顺畅" if reach_reliable else "待补拍", "unit": "", "delta": "只比较前伸事件", "tone": "warning" if reach_problem else "positive" if reach_reliable else "neutral"},
             {"label": "姿态覆盖", "value": f"{detection:.0f}", "unit": "%", "delta": "水面遮挡会影响", "tone": "positive" if detection >= 60 else "neutral"},
         ],
         "insights": [
-            {"id": "reach", "title": headline, "summary": primary_summary, "impact": primary_impact, "action": primary_action, "successCue": primary_cue, "severity": severity, "timestamp": _format_timestamp(evidences["A"][0].timestamp), "marker": "A", "image": evidence_urls["A"]},
-            {"id": "line", "title": "身体大部分时间能贴近水面" if line_deviation < 8 else "身体中段有明显下沉", "summary": "这个动作时刻，肩膀、髋部和脚没有朝同一个方向延伸，身体中间向下掉。" if line_deviation >= 8 else "这个动作时刻，从肩膀到脚能够保持舒展，身体比较贴近水面。", "impact": "身体下沉会增大迎水面积，每次划水都要先克服更多阻力。" if line_deviation >= 8 else "身体接近平直，同样的划水力量可以让你滑得更远。", "action": "下一趟只关注眼睛看池底、后脑勺放松，同时轻轻收紧腹部，让髋部靠近水面。", "successCue": "会感觉臀部更接近水面，脚后跟偶尔轻轻打到水面。", "severity": "good" if line_deviation < 8 else "observe", "timestamp": _format_timestamp(evidences["B"][0].timestamp), "marker": "B", "image": evidence_urls["B"]},
-            {"id": "arms", "title": "两侧划水路径比较接近" if elbow_difference < 12 else "两只手臂的划水动作差得比较多", "summary": "这个动作时刻，一侧已经开始推水，另一侧还停在前伸位置，左右节奏没有接上。" if elbow_difference >= 12 else "这个动作时刻，两侧划水能够自然衔接，没有明显停顿。", "impact": "两侧动作不同会打乱划水节奏，一侧更容易提前疲劳。" if elbow_difference >= 12 else "两侧节奏接近，有利于保持直线前进。", "action": "做 4 组单臂自由泳，每侧 25 米，注意两边都先向前伸长，再用前臂把水向后推。", "successCue": "左右两侧每次划水的用力时间接近，身体不会突然向一边扭。", "severity": "good" if elbow_difference < 12 else "observe", "timestamp": _format_timestamp(evidences["C"][0].timestamp), "marker": "C", "image": evidence_urls["C"]},
-            {"id": "kick", "title": "打腿幅度比较轻松" if knee_flexion < 35 else "打腿时膝盖弯得太多", "summary": "这个动作时刻，小腿从膝盖后方向下甩，像在踩水，而不是整条腿从髋部带动。" if knee_flexion >= 35 else "这个动作时刻，腿部能够从髋部带动，膝盖没有明显折起。", "impact": "膝盖弯得太多会让大腿迎水，阻力增加，还会消耗更多体力。" if knee_flexion >= 35 else "小幅打腿能减少阻力，也更容易保持身体平稳。", "action": "做 4 组 20 秒扶板打腿，脚踝放松，只让大腿从髋部小幅上下摆动。", "successCue": "水花集中在脚边，膝盖不会频繁露出水面，腿部感觉轻而连续。", "severity": "good" if knee_flexion < 35 else "observe", "timestamp": _format_timestamp(evidences["D"][0].timestamp), "marker": "D", "image": evidence_urls["D"]},
+            {"id": "head", "title": headline, "summary": primary_summary, "impact": primary_impact, "action": primary_action, "successCue": primary_cue, "severity": severity, "timestamp": _format_timestamp(evidences["A"][0].timestamp), "marker": "A", "image": evidence_urls["A"]},
+            insight("B", "line", body_reliable, body_problem, "身体线保持得比较舒展", "身体向下形成了明显斜坡", "多个动作里，肩、髋和脚能朝同一方向延伸，身体没有反复折下去。", "多个动作里，髋腿会落到肩膀下方，身体像一条向下的斜坡。", "髋腿下沉会增大迎水面积，同样的划水力量滑行距离会变短。", "做 4 趟轻松游：眼睛看池底、腹部轻轻收紧，想象有人从脚后跟把身体拉长。", "会感觉臀部更接近水面，脚后跟偶尔轻触水面。", "身体线"),
+            insight("C", "reach", reach_reliable, reach_problem, "前手能先向前伸长再抓水", "前手还没伸长就开始向下压", "在前手到达最远位置时，手臂仍朝前延伸，没有急着向下压水。", "前手刚到头前方就开始下压，身体来不及借助前伸继续滑行。", "过早下压会缩短每次划水的有效距离，也容易让头肩跟着抬起。", "做 4 趟追赶游：前手保持向前，另一只手快碰到前手时，再开始抓水。", "每次入水后都能感到身体先向前滑一下，再由前臂把水向后送。", "前伸动作"),
+            insight("D", "kick", kick_reliable, kick_problem, "打腿幅度轻而连续", "打腿主要从膝盖发力", "多个打腿动作里，膝盖保持自然放松，整条腿由髋部带动。", "多个动作里，小腿先向后折再甩水，看起来像在水中踩踏。", "从膝盖用力会让大腿迎水，增加阻力，也更快消耗体力。", "做 4 组 20 秒侧身打腿：脚踝放松，从髋部发起小幅、连续的上下摆动。", "水花集中在脚边，膝盖不会频繁露出水面，腿部感觉轻而不断。", "打腿动作"),
         ],
         "fileName": file_name,
     }
+
+
+def _adapt_swimming_report_to_stroke(report: dict, stroke_result: dict[str, object]) -> dict:
+    stroke = str(stroke_result["stroke"])
+    if stroke == "freestyle":
+        return report
+
+    profiles = {
+        "backstroke": {
+            "headline": "先让头、髋和打腿保持在同一条线上",
+            "summary": "系统识别为仰泳。建议先稳定仰卧身体线，再检查手臂入水和连续打腿。",
+            "insights": [
+                ("头部保持稳定朝上", "后脑勺自然放在水里，不要用下巴寻找脚的方向。", "下巴微收、眼睛看上方，让水面停在耳朵附近。", "头不左右摇，髋部更容易贴近水面。"),
+                ("髋部跟着胸口一起浮起", "身体中段下沉会让腿部承担更多抬升工作。", "轻轻抬胸并收紧腹部，想象肚脐靠近水面。", "髋部不再往下掉，打腿水花集中在脚边。"),
+                ("手臂沿肩线方向入水", "手臂跨过头部中线会带动身体蛇形摆动。", "小拇指先入水，手掌落在同侧肩膀延长线上。", "每次入水身体仍朝泳道正前方移动。"),
+                ("打腿要小而连续", "膝盖大幅露出水面会形成踩水动作并增加阻力。", "从髋部发起快速小幅打腿，脚踝保持放松。", "脚尖在水面附近持续翻水，膝盖不明显露出。"),
+            ],
+        },
+        "breaststroke": {
+            "headline": "先把前伸、收腿和滑行接成清楚的顺序",
+            "summary": "系统识别为蛙泳。建议重点检查手腿配合和蹬夹后的身体伸展。",
+            "insights": [
+                ("换气后及时把头放回身体线", "头一直抬在水面会让髋腿持续下沉。", "吸气后低头前伸，让耳朵重新回到手臂之间。", "双手前伸时能看到池底，身体自然向前滑。"),
+                ("蹬夹后先保持身体伸长", "没有滑行会让动作变得急促，每次蹬腿的推进没有被充分利用。", "每次蹬夹结束后保持一次流线，再开始下一次划手。", "会感到身体安静向前滑一小段，而不是立即忙着划手。"),
+                ("双手向前伸直后再滑行", "手臂过早向外划会缩短前伸并打乱节奏。", "双手在胸前合拢后快速向前送，手臂夹住耳朵。", "双手、头和胸口朝同一方向延伸。"),
+                ("收腿窄一些，脚掌向后蹬夹", "膝盖打开过宽会增加迎水面积，也容易把力量蹬向两侧。", "脚跟靠近臀部，膝盖不超过肩宽，再把脚掌向后蹬开并合拢。", "蹬腿后双腿能快速并拢，推进方向主要向前。"),
+            ],
+        },
+        "butterfly": {
+            "headline": "先让躯干波动带动双臂和双腿",
+            "summary": "系统识别为蝶泳。建议先检查身体波动、双臂同步和两次海豚腿节奏。",
+            "insights": [
+                ("换气时头部向前贴水", "过度抬头会压低髋部，让手臂回臂更费力。", "下巴贴近水面向前吸气，双手入水前让头先回到水中。", "头先入水、手随后入水，髋部不会突然下沉。"),
+                ("波动从胸口传到髋部", "只靠腰部折叠会让身体上下起伏过大。", "先轻压胸口，再让髋部和双腿顺势跟随，不要主动塌腰。", "波浪连续经过身体，动作不会卡在腰部。"),
+                ("双臂同时入水后向前延伸", "两臂不同步会让身体向一侧扭转并打乱第二次打腿。", "双臂放松回臂，在肩膀前方同时入水并向前伸长。", "两只手几乎同时碰水，身体继续直线前进。"),
+                ("两次海豚腿要服务于划臂节奏", "膝盖主动大幅甩腿会增加阻力，也难以维持连续波动。", "手入水时轻踢一次，推水结束时再有力踢一次，动作从髋部发起。", "两次打腿都能和手臂动作对上，不会单独抢拍。"),
+            ],
+        },
+        "unknown": {
+            "headline": "泳姿证据不足，暂不套用专项规则",
+            "summary": "画面中的手臂或腿部被遮挡，系统无法可靠区分自由泳、蛙泳、仰泳或蝶泳。",
+            "insights": [
+                ("需要看到头部与肩膀", "当前画面不足以判断呼吸和身体朝向。", "从泳道侧面固定机位拍摄，保留头部和肩膀。", "回放能连续看见头部动作。"),
+                ("需要看到完整身体线", "身体被画面边缘裁切后无法判断髋腿位置。", "让头到脚都留在画面内，并减少镜头跟随晃动。", "至少两个完整周期全身不出画。"),
+                ("需要看到双臂动作关系", "判断泳姿依赖双臂是交替还是同步。", "拍摄时不要让近侧手臂长期遮住另一只手臂。", "回放能分辨两只手的入水和划水时机。"),
+                ("需要看到收腿或打腿方式", "腿部动作是区分泳姿的重要证据。", "机位稍微拉远，让膝盖、脚踝和脚掌完整出现。", "回放能看清至少两次完整腿部动作。"),
+            ],
+        },
+    }
+    profile = profiles.get(stroke, profiles["unknown"])
+    report["headline"] = profile["headline"]
+    report["summary"] = profile["summary"]
+    for insight, content in zip(report["insights"], profile["insights"]):
+        insight["title"], insight["summary"], insight["action"], insight["successCue"] = content
+        insight["impact"] = content[1]
+        insight["severity"] = "observe"
+    return report
 
 
 def analyze_video(
@@ -804,6 +1148,7 @@ def analyze_video(
     output_path: Path,
     media_url: str,
     progress: ProgressCallback,
+    swim_stroke_hint: str | None = None,
 ) -> dict:
     pose_frames, metadata = _extract_pose_frames(video_path, progress)
     body_axis_angle = _body_axis_angle_from_horizontal(pose_frames)
@@ -812,12 +1157,26 @@ def analyze_video(
         raise AnalysisError("SPORT_MISMATCH", "画面中的身体长期接近水平，更像游泳视频。请切换到游泳后重新分析。")
     if sport == "swimming" and body_axis_angle > 55:
         raise AnalysisError("SPORT_MISMATCH", "画面中的身体长期接近直立，更像跑步视频。请切换到跑步后重新分析。")
+    stroke_result: dict[str, object] | None = None
+    if sport == "swimming":
+        progress(78, "识别泳姿与动作周期")
+        stroke_result = _classify_swim_stroke(pose_frames)
+        if swim_stroke_hint in SWIM_STROKE_NAMES and swim_stroke_hint != "unknown":
+            stroke_result["stroke"] = swim_stroke_hint
+            stroke_result["strokeName"] = SWIM_STROKE_NAMES[swim_stroke_hint]
+            stroke_result["reusedFromSameVideo"] = True
+        metadata["swimStrokeConfidence"] = float(stroke_result["confidence"])
     progress(82, "计算专项动作指标")
     if sport == "running":
         report = _running_report(video_path, report_id, file_name, pose_frames, metadata, media_url, output_path)
     elif sport == "swimming":
-        report = _swimming_report(video_path, report_id, file_name, pose_frames, metadata, media_url, output_path)
+        assert stroke_result is not None
+        report = _swimming_report(video_path, report_id, file_name, pose_frames, metadata, media_url, output_path, stroke_result)
+        report = _adapt_swimming_report_to_stroke(report, stroke_result)
     else:
         raise AnalysisError("SPORT_NOT_SUPPORTED", "当前只支持跑步和游泳。")
-    progress(96, "生成真实证据帧")
+    report = _enrich_report(report, pose_frames, metadata)
+    progress(92, "生成证据短片与训练处方")
+    _render_evidence_clips(video_path, report["insights"], output_path, media_url)
+    progress(96, "完成证据与质量校验")
     return report

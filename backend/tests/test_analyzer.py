@@ -53,6 +53,11 @@ class AnalyzerTest(unittest.TestCase):
             self.assertGreaterEqual(len(report["insights"]), 4)
             self.assertGreaterEqual(len({insight["timestamp"] for insight in report["insights"]}), 4)
             self.assertGreaterEqual(len({insight["image"] for insight in report["insights"]}), 4)
+            self.assertEqual(len({insight["clip"] for insight in report["insights"]}), 4)
+            self.assertIn("qualityAssessment", report)
+            self.assertIn("prescription", report)
+            self.assertEqual(report["pipeline"]["pipelineVersion"], "2.0.0")
+            self.assertEqual(report["modelReview"]["status"], "engineering_fallback")
             self.assertNotIn("°", " ".join(insight["summary"] for insight in report["insights"]))
             self.assertTrue(updates)
 
@@ -72,6 +77,43 @@ class AnalyzerTest(unittest.TestCase):
                     progress=lambda *_: None,
                 )
             self.assertEqual(context.exception.code, "SPORT_MISMATCH")
+
+    def test_freestyle_report_uses_four_coach_friendly_evidence_frames(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            video_path = directory / "swimmer.mp4"
+            evidence_path = directory / "evidence.jpg"
+            self._create_static_video("swimmer.jpg", video_path)
+
+            report = analyze_video(
+                video_path=video_path,
+                sport="swimming",
+                report_id="swim-report",
+                file_name="swimmer.mp4",
+                output_path=evidence_path,
+                media_url="http://test/media/evidence.jpg",
+                progress=lambda *_: None,
+            )
+
+            self.assertEqual(report["sport"], "swimming")
+            self.assertIn("泳姿待确认", report["title"])
+            self.assertEqual(report["swimStroke"]["stroke"], "unknown")
+            self.assertLess(report["swimStroke"]["confidence"], 48)
+            self.assertEqual(len(report["swimStroke"]["candidates"]), 2)
+            self.assertEqual([item["marker"] for item in report["insights"]], ["A", "B", "C", "D"])
+            self.assertEqual(len({item["image"] for item in report["insights"]}), 4)
+            user_copy = " ".join(
+                item[key]
+                for item in report["insights"]
+                for key in ("title", "summary", "impact", "action", "successCue")
+            )
+            self.assertNotIn("°", user_copy)
+            self.assertNotIn("角度", user_copy)
+            self.assertNotIn("左右肘", user_copy)
+            for marker in ("", "-b", "-c", "-d"):
+                self.assertTrue((directory / f"evidence{marker}.jpg").exists())
+            for marker in ("a", "b", "c", "d"):
+                self.assertGreater((directory / f"clip-{marker}.mp4").stat().st_size, 0)
 
 
 if __name__ == "__main__":

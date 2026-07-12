@@ -18,11 +18,13 @@ import {
   Link2,
   LockKeyhole,
   Plus,
+  Pencil,
   RotateCcw,
   Share2,
   ShieldCheck,
   Sparkles,
   TimerReset,
+  Trash2,
   TrendingUp,
   Upload,
   Waves,
@@ -30,7 +32,7 @@ import {
   Zap,
 } from 'lucide-react'
 import { dataSources, reports } from './data/demo'
-import { createAnalysisJob, getAnalysisJob, getAnalysisReport } from './lib/analysis-api'
+import { correctSwimStroke, createAnalysisJob, deleteAnalysisReport, getAnalysisJob, getAnalysisReport, getAnalysisReports, submitInsightFeedback, updateAnalysisReport } from './lib/analysis-api'
 import { loadLocalReports, persistLocalReports } from './lib/report-storage'
 import { loadLocalWorkouts, persistLocalWorkouts } from './lib/workout-storage'
 import type { AnalysisReport, AppTab, Insight, Sport, WorkoutRecord } from './types/domain'
@@ -67,6 +69,20 @@ function formatWorkoutDate(value: string) {
   if (value === todayValue() || value === '今天') return '今天'
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value)
   return match ? `${Number(match[2])}月${Number(match[3])}日` : value
+}
+
+function formatReportDate(report: AnalysisReport) {
+  const source = report.createdAt ? new Date(report.createdAt) : report.trainingDate ? new Date(`${report.trainingDate}T00:00:00`) : null
+  if (!source || Number.isNaN(source.getTime())) return report.date
+  const date = `${source.getFullYear()}年${source.getMonth() + 1}月${source.getDate()}日`
+  return report.createdAt ? `${date} ${source.getHours().toString().padStart(2, '0')}:${source.getMinutes().toString().padStart(2, '0')}` : date
+}
+
+function defaultReportName(report: AnalysisReport) {
+  if (report.displayName) return report.displayName
+  const value = report.trainingDate ?? report.createdAt?.slice(0, 10)
+  const match = value ? /^(\d{4})-(\d{2})-(\d{2})$/.exec(value) : null
+  return match ? `${Number(match[2])}月${Number(match[3])}日训练记录` : report.title
 }
 
 function SportIcon({ sport, size = 18 }: { sport: Sport; size?: number }) {
@@ -170,22 +186,28 @@ function EvidenceOverlay({ sport, insight }: { sport: Sport; insight?: Insight }
   )
 }
 
-function ReportPreview({ report, onOpen }: { report: AnalysisReport; onOpen: () => void }) {
+function ReportPreview({ report, onOpen, onEdit, onDelete }: { report: AnalysisReport; onOpen: () => void; onEdit?: () => void; onDelete?: () => void }) {
   const isDemo = report.source === 'demo'
   return (
-    <button className="report-preview" onClick={onOpen} aria-label={`查看${report.title}`}>
-      <div className="report-thumb">
-        <img src={report.image} alt={`${report.sport === 'running' ? '跑步' : '游泳'}${isDemo ? '示例' : '视频'}证据帧`} />
-        {isDemo ? <EvidenceOverlay sport={report.sport} insight={report.insights[0]} /> : null}
-        <span className={`sport-badge ${report.sport}`}><SportIcon sport={report.sport} size={14} />{report.sport === 'running' ? '跑步' : '游泳'}</span>
-        <span className={`media-demo-label ${isDemo ? '' : 'real'}`}>{isDemo ? '示例' : '真实视频'}</span>
+    <article className="report-preview">
+      <div className="report-thumb-shell">
+        <button className="report-image-open" onClick={onOpen} aria-label={`查看${defaultReportName(report)}`}>
+          <div className="report-thumb">
+          <img src={report.image} alt={`${report.sport === 'running' ? '跑步' : '游泳'}${isDemo ? '示例' : '视频'}证据帧`} />
+          {isDemo ? <EvidenceOverlay sport={report.sport} insight={report.insights[0]} /> : null}
+          <span className={`sport-badge ${report.sport}`}><SportIcon sport={report.sport} size={14} />{report.sport === 'running' ? '跑步' : report.swimStroke?.strokeName ?? '游泳'}</span>
+          <span className={`media-demo-label ${isDemo ? '' : 'real'}`}>{isDemo ? '示例' : '真实视频'}</span>
+          </div>
+        </button>
+        {!isDemo && onEdit && onDelete ? <span className="report-actions overlay"><button onClick={onEdit} aria-label="编辑报告" title="编辑报告"><Pencil size={16} /></button><button onClick={onDelete} aria-label="删除报告" title="删除报告"><Trash2 size={16} /></button></span> : null}
       </div>
-      <div className="report-preview-body">
-        <div><span className="eyebrow">{isDemo ? '示例报告' : '视频报告'} · {report.date}</span><h3>{report.headline}</h3></div>
-        <div className="report-score"><strong>{isDemo ? report.score : report.insights.length}</strong><span>{isDemo ? '示例分' : '个关键时刻'}</span></div>
-      </div>
-      <div className="report-link">查看{isDemo ? '示例' : '完整'}报告 <ChevronRight size={17} /></div>
-    </button>
+      <button className="report-open" onClick={onOpen} aria-label={`查看${defaultReportName(report)}详情`}>
+        <div className="report-preview-body">
+          <div><span className="eyebrow">{isDemo ? '示例报告' : formatReportDate(report)}</span><h3>{isDemo ? report.title : defaultReportName(report)}</h3>{!isDemo ? <p>{report.headline}</p> : null}</div>
+          <div className="report-score"><strong>{isDemo ? report.score : report.insights.length}</strong><span>{isDemo ? '示例分' : '个关键时刻'}</span></div>
+        </div>
+      </button>
+    </article>
   )
 }
 
@@ -221,7 +243,7 @@ function HomeView({ workouts, onAnalyze, onOpenReport, onOpenReports, onProfile,
               <span className="sport-action-icon"><Footprints size={24} /></span><span><strong>分析跑步</strong><small>侧面拍摄效果更好</small></span><ArrowRight size={19} />
             </button>
             <button className="sport-action swimming" onClick={() => onAnalyze('swimming')}>
-              <span className="sport-action-icon"><Waves size={24} /></span><span><strong>分析游泳</strong><small>泳池侧面完整入镜</small></span><ArrowRight size={19} />
+              <span className="sport-action-icon"><Waves size={24} /></span><span><strong>分析游泳</strong><small>自动识别泳姿并分析</small></span><ArrowRight size={19} />
             </button>
           </div>
         </section>
@@ -487,7 +509,7 @@ function AnalyzeView({ onReportReady, onOpenReport }: { onReportReady: (report: 
 
         {phase === 'ready' ? (
           <section className="video-ready">
-            <div className="video-frame"><video src={videoUrl} controls playsInline preload="metadata" /><span className={`sport-badge ${sport}`}><SportIcon sport={sport} size={14} />{sport === 'running' ? '跑步' : '游泳'}</span></div>
+            <div className="video-frame"><video src={videoUrl} controls playsInline preload="metadata" /><span className={`sport-badge ${sport}`}><SportIcon sport={sport} size={14} />{sport === 'running' ? '跑步' : '自动识别泳姿'}</span></div>
             <div className="file-row"><FileVideo2 size={20} /><div><strong>{fileName}</strong><span>将在本机分析服务中抽帧并识别姿态</span></div><Check size={18} className="success" /></div>
             {validationError ? <div className="form-error standalone" role="alert">{validationError}</div> : null}
             <button className="primary-button wide" onClick={startAnalysis}><Sparkles size={18} /> 开始真实分析</button>
@@ -527,11 +549,40 @@ function AnalyzeView({ onReportReady, onOpenReport }: { onReportReady: (report: 
 }
 
 function ReportDetail({ report, onBack, onToast }: { report: AnalysisReport; onBack: () => void; onToast: (message: string) => void }) {
+  const [displayReport, setDisplayReport] = useState(report)
   const [activeInsight, setActiveInsight] = useState(report.insights[0])
+  const [showStrokeChoices, setShowStrokeChoices] = useState(false)
+  const [feedback, setFeedback] = useState<Record<string, string>>({})
   const evidenceRef = useRef<HTMLElement | null>(null)
   const isDemo = report.source === 'demo'
   const activeEvidenceIndex = Math.max(0, report.insights.findIndex((insight) => insight.id === activeInsight.id))
   const evidenceProgress = report.insights.length <= 1 ? 100 : activeEvidenceIndex / (report.insights.length - 1) * 100
+
+  useEffect(() => {
+    setDisplayReport(report)
+    setActiveInsight(report.insights[0])
+  }, [report])
+
+  const updateStroke = async (stroke: 'freestyle' | 'breaststroke' | 'backstroke' | 'butterfly') => {
+    try {
+      const next = await correctSwimStroke(report.id, stroke)
+      setDisplayReport(next)
+      setShowStrokeChoices(false)
+      onToast('已记录泳姿修正，专项建议需重新分析后更新')
+    } catch (error) {
+      onToast(error instanceof Error ? error.message : '泳姿修正失败')
+    }
+  }
+
+  const sendFeedback = async (value: 'accurate' | 'inaccurate' | 'unclear') => {
+    try {
+      await submitInsightFeedback(report.id, activeInsight.id, value)
+      setFeedback((current) => ({ ...current, [activeInsight.id]: value }))
+      onToast('反馈已记录')
+    } catch (error) {
+      onToast(error instanceof Error ? error.message : '反馈提交失败')
+    }
+  }
 
   const shareReport = async () => {
     const payload = { title: report.title, text: `NeverStop ${isDemo ? '示例' : '动作'}报告：${report.headline}`, url: window.location.href }
@@ -552,8 +603,11 @@ function ReportDetail({ report, onBack, onToast }: { report: AnalysisReport; onB
       <main>
         {isDemo ? <DemoNotice compact /> : null}
         <section className="report-hero">
-          <div className="report-meta"><span className={`sport-tag ${report.sport}`}><SportIcon sport={report.sport} size={15} />{report.sport === 'running' ? '跑步' : '游泳'}</span><span>{isDemo ? '示例报告' : '真实视频报告'}</span><span>{report.duration}</span></div>
-          <div className={`report-title-row ${isDemo ? '' : 'without-score'}`}><div><span className="eyebrow">AI 动作总结{isDemo ? '示例' : ''}</span><h1>{report.headline}</h1></div>{isDemo ? <ScoreRing score={report.score} compact /> : null}</div>
+          <div className="report-meta"><span className={`sport-tag ${displayReport.sport}`}><SportIcon sport={displayReport.sport} size={15} />{displayReport.sport === 'running' ? '跑步' : displayReport.swimStroke?.strokeName ?? '游泳'}</span>{displayReport.swimStroke ? <span>泳姿置信度 {displayReport.swimStroke.confidence}%</span> : null}<span>{isDemo ? '示例报告' : formatReportDate(displayReport)}</span><span>{report.duration}</span></div>
+          {!isDemo && displayReport.swimStroke ? <div className="stroke-confirm"><span>识别泳姿是否正确？</span><button className="secondary-button compact" onClick={() => onToast('已确认当前泳姿') }><Check size={15} />正确</button><button className="text-button" onClick={() => setShowStrokeChoices((value) => !value)}>修改</button>{showStrokeChoices ? <div className="stroke-options">{([['freestyle', '自由泳'], ['breaststroke', '蛙泳'], ['backstroke', '仰泳'], ['butterfly', '蝶泳']] as const).map(([value, label]) => <button key={value} onClick={() => updateStroke(value)}>{label}</button>)}</div> : null}</div> : null}
+          {displayReport.adviceNeedsReanalysis ? <div className="quality-warning"><Info size={17} />泳姿已修正，当前证据仍来自原分析，请重新上传后生成对应专项建议。</div> : null}
+          {report.qualityAssessment?.status === 'limited' ? <div className="quality-warning"><Info size={17} /><div><strong>本次证据有限</strong><p>{report.qualityAssessment.blockingIssues.join('；')}</p></div></div> : null}
+          <div className={`report-title-row ${isDemo ? '' : 'without-score'}`}><div><span className="eyebrow">{isDemo ? 'AI 动作总结示例' : displayReport.displayName ?? 'AI 动作总结'}</span><h1>{report.headline}</h1></div>{isDemo ? <ScoreRing score={report.score} compact /> : null}</div>
           <p>{report.summary}</p>
           {isDemo ? <div className="score-method"><span><strong>评分维度</strong>稳定性、对称性、专项动作</span><span><strong>结果置信度</strong>示例数据，不提供真实置信度</span></div> : null}
         </section>
@@ -561,7 +615,7 @@ function ReportDetail({ report, onBack, onToast }: { report: AnalysisReport; onB
         <section className="evidence-section" ref={evidenceRef}>
           <SectionHeading title="关键证据" action={<span className="demo-pill">{isDemo ? '示例关键帧' : '视频关键帧'}</span>} />
           <div className="evidence-viewer">
-            <img src={activeInsight.image ?? report.image} alt={`${report.title}${isDemo ? '示例' : '视频'}关键动作帧 ${activeInsight.marker}`} />{isDemo ? <EvidenceOverlay sport={report.sport} insight={activeInsight} /> : null}
+            {activeInsight.clip && !isDemo ? <video key={activeInsight.clip} src={activeInsight.clip} poster={activeInsight.image ?? report.image} controls muted playsInline preload="metadata" /> : <img src={activeInsight.image ?? report.image} alt={`${report.title}${isDemo ? '示例' : '视频'}关键动作帧 ${activeInsight.marker}`} />}{isDemo ? <EvidenceOverlay sport={report.sport} insight={activeInsight} /> : null}
             <div className="frame-top"><span>{activeInsight.timestamp}</span><span>关键帧 {activeInsight.marker}</span></div>
           </div>
           <div className="timeline">
@@ -575,6 +629,7 @@ function ReportDetail({ report, onBack, onToast }: { report: AnalysisReport; onB
               <div className="action"><span className="coach-label">下次这样做</span><p>{activeInsight.action}</p></div>
               <div className="success"><span className="coach-label">做对时的感觉</span><p>{activeInsight.successCue ?? '动作会更顺畅、更稳定，也不会需要额外用力补偿。'}</p></div>
             </div>
+            {!isDemo ? <div className="evidence-feedback"><span>这条判断对你有帮助吗？</span><button className={feedback[activeInsight.id] === 'accurate' ? 'active' : ''} onClick={() => sendFeedback('accurate')}><Check size={15} />准确</button><button className={feedback[activeInsight.id] === 'inaccurate' ? 'active' : ''} onClick={() => sendFeedback('inaccurate')}><X size={15} />不准确</button><button className={feedback[activeInsight.id] === 'unclear' ? 'active' : ''} onClick={() => sendFeedback('unclear')}><Info size={15} />没看懂</button></div> : null}
           </div>
         </section>
 
@@ -586,15 +641,37 @@ function ReportDetail({ report, onBack, onToast }: { report: AnalysisReport; onB
           {report.insights.map((insight, index) => <button key={insight.id} className="insight-row" onClick={() => { setActiveInsight(insight); window.scrollTo({ top: Math.max(0, (evidenceRef.current?.offsetTop ?? 80) - 72), behavior: 'smooth' }) }}><span className={`insight-number ${insight.severity}`}>{index + 1}</span><div><strong>{insight.title}</strong><p><b>练法：</b>{insight.action}</p><small>证据 {insight.marker} · {insight.timestamp}{insight.successCue ? ` · 做对：${insight.successCue}` : ''}</small></div><ChevronRight size={18} /></button>)}
         </div></section>
 
-        <section className="next-session"><div><span className="eyebrow">下次只练这一件</span><h2>{report.insights[0].title}</h2><p>{report.insights[0].action}</p><small>判断做对：{report.insights[0].successCue ?? '动作更顺畅，并且不需要额外用力补偿。'}</small></div><TimerReset size={34} /></section>
+        <section className="next-session"><div><span className="eyebrow">下次只练这一件</span><h2>{report.prescription?.focusCue ?? report.insights[0].title}</h2><p>{report.prescription?.drill ?? report.insights[0].action}</p><small>{report.prescription ? `${report.prescription.volume} · ${report.prescription.rest} · ` : ''}判断做对：{report.prescription?.successCue ?? report.insights[0].successCue ?? '动作更顺畅，并且不需要额外用力补偿。'}</small></div><TimerReset size={34} /></section>
+        {!isDemo && report.comparison ? <section className="comparison-summary"><span className="eyebrow">历史对比</span><h2>{report.comparison.status === 'comparable' ? '已与最近一次同泳姿训练对齐' : '暂时没有可比较的历史训练'}</h2><p>{report.comparison.status === 'comparable' ? `${report.comparison.basis}。仍需关注 ${report.comparison.remaining?.length ?? 0} 项，新出现 ${report.comparison.newIssues?.length ?? 0} 项。` : report.comparison.reason}</p></section> : null}
+        {!isDemo && report.modelReview ? <p className="ai-provenance">{report.modelReview.status === 'reviewed' ? '已通过 MiniMax 结构化复核' : '工程分析模式'} · {report.modelReview.reason}</p> : null}
         <p className="report-disclaimer">{isDemo ? '本报告为交互演示，仅用于展示产品结构，' : '本报告基于视频关键点估算，'}不构成医疗诊断或治疗建议。</p>
       </main>
     </div>
   )
 }
 
-function ReportsView({ allReports, onOpenReport, onBack }: { allReports: AnalysisReport[]; onOpenReport: (report: AnalysisReport) => void; onBack: () => void }) {
+function ReportEditModal({ report, onClose, onSave, onDelete }: { report: AnalysisReport; onClose: () => void; onSave: (input: { displayName: string; trainingDate: string }) => Promise<void>; onDelete: () => Promise<void> }) {
+  const [displayName, setDisplayName] = useState(defaultReportName(report))
+  const [trainingDate, setTrainingDate] = useState(report.trainingDate ?? report.createdAt?.slice(0, 10) ?? todayValue())
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const submit = async (event: FormEvent) => {
+    event.preventDefault()
+    if (!displayName.trim()) return setError('请输入报告名称。')
+    setBusy(true)
+    try { await onSave({ displayName: displayName.trim(), trainingDate }); onClose() } catch (reason) { setError(reason instanceof Error ? reason.message : '保存失败') } finally { setBusy(false) }
+  }
+  const remove = async () => {
+    if (!window.confirm(`确定删除“${displayName}”吗？相关证据图片和短片也会删除，且无法恢复。`)) return
+    setBusy(true)
+    try { await onDelete(); onClose() } catch (reason) { setError(reason instanceof Error ? reason.message : '删除失败'); setBusy(false) }
+  }
+  return <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><form className="modal-sheet" onSubmit={submit}><div className="modal-head"><h2>编辑动作报告</h2><button className="icon-button quiet" type="button" onClick={onClose} aria-label="关闭"><X size={20} /></button></div><label><span>报告名称</span><input value={displayName} maxLength={80} onChange={(event) => setDisplayName(event.target.value)} /></label><label><span>训练日期</span><input type="date" value={trainingDate} onChange={(event) => setTrainingDate(event.target.value)} /></label>{error ? <div className="form-error standalone">{error}</div> : null}<button className="primary-button wide" disabled={busy} type="submit"><Check size={17} />保存修改</button><button className="danger-button wide" disabled={busy} type="button" onClick={remove}><Trash2 size={17} />删除报告</button></form></div>
+}
+
+function ReportsView({ allReports, onOpenReport, onUpdateReport, onDeleteReport, onBack }: { allReports: AnalysisReport[]; onOpenReport: (report: AnalysisReport) => void; onUpdateReport: (report: AnalysisReport, input: { displayName: string; trainingDate: string }) => Promise<void>; onDeleteReport: (report: AnalysisReport) => Promise<void>; onBack: () => void }) {
   const [sport, setSport] = useState<'all' | Sport>('all')
+  const [editing, setEditing] = useState<AnalysisReport | null>(null)
   const visibleReports = useMemo(() => sport === 'all' ? allReports : allReports.filter((report) => report.sport === sport), [sport, allReports])
   return (
     <div className="view reports-view">
@@ -603,7 +680,7 @@ function ReportsView({ allReports, onOpenReport, onBack }: { allReports: Analysi
         <button className={sport === 'all' ? 'active' : ''} onClick={() => setSport('all')}>全部</button>
         <button className={sport === 'running' ? 'active' : ''} onClick={() => setSport('running')}><Footprints size={15} />跑步</button>
         <button className={sport === 'swimming' ? 'active' : ''} onClick={() => setSport('swimming')}><Waves size={15} />游泳</button>
-      </div><div className="report-list">{visibleReports.map((report) => <ReportPreview key={report.id} report={report} onOpen={() => onOpenReport(report)} />)}</div></main>
+      </div><div className="report-list">{visibleReports.map((report) => <ReportPreview key={report.id} report={report} onOpen={() => onOpenReport(report)} onEdit={report.source === 'video' ? () => setEditing(report) : undefined} onDelete={report.source === 'video' ? () => setEditing(report) : undefined} />)}</div></main>{editing ? <ReportEditModal report={editing} onClose={() => setEditing(null)} onSave={(input) => onUpdateReport(editing, input)} onDelete={() => onDeleteReport(editing)} /> : null}
     </div>
   )
 }
@@ -713,6 +790,13 @@ function App() {
   const toastTimer = useRef<number | null>(null)
   const allReports = useMemo(() => [...localReports, ...reports], [localReports])
 
+  useEffect(() => {
+    getAnalysisReports().then((stored) => {
+      setLocalReports(stored)
+      persistLocalReports(stored)
+    }).catch(() => undefined)
+  }, [])
+
   const activeTab: AppTab = location.pathname.startsWith('/analyze') ? 'analyze' : location.pathname.startsWith('/progress') || location.pathname.startsWith('/reports') ? 'progress' : location.pathname.startsWith('/me') ? 'profile' : 'home'
 
   const showToast = (message: string) => {
@@ -737,6 +821,26 @@ function App() {
       persistLocalReports(next)
       return next
     })
+  }
+
+  const updateReportRecord = async (report: AnalysisReport, input: { displayName: string; trainingDate: string }) => {
+    const updated = await updateAnalysisReport(report.id, input)
+    setLocalReports((current) => {
+      const next = current.map((item) => item.id === updated.id ? updated : item)
+      persistLocalReports(next)
+      return next
+    })
+    showToast('报告信息已更新')
+  }
+
+  const deleteReportRecord = async (report: AnalysisReport) => {
+    await deleteAnalysisReport(report.id)
+    setLocalReports((current) => {
+      const next = current.filter((item) => item.id !== report.id)
+      persistLocalReports(next)
+      return next
+    })
+    showToast('报告及相关证据已删除')
   }
 
   const saveWorkout = (input: ManualRecordInput) => {
@@ -764,8 +868,8 @@ function App() {
         <Routes>
           <Route path="/" element={<HomeView workouts={workouts} latestReport={localReports[0]} onAnalyze={(sport) => navigate(`/analyze?sport=${sport}`)} onOpenReport={openReport} onOpenReports={() => navigate('/reports')} onProfile={() => navigate('/me')} />} />
           <Route path="/analyze" element={<AnalyzeView onReportReady={saveReport} onOpenReport={openReport} />} />
-          <Route path="/reports" element={<ReportsView allReports={allReports} onOpenReport={openReport} onBack={() => navigate('/progress')} />} />
-          <Route path="/reports/:reportId" element={<ReportRoute allReports={allReports} onBack={() => navigate('/reports')} onToast={showToast} />} />
+          <Route path="/reports" element={<ReportsView allReports={allReports} onOpenReport={openReport} onUpdateReport={updateReportRecord} onDeleteReport={deleteReportRecord} onBack={() => navigate('/progress')} />} />
+          <Route path="/reports/:reportId" element={<ReportRoute allReports={allReports} onLoaded={saveReport} onBack={() => navigate('/reports')} onToast={showToast} />} />
           <Route path="/progress" element={<ProgressView onOpenReports={() => navigate('/reports')} />} />
           <Route path="/me" element={<ProfileView workouts={workouts} onSaveWorkout={saveWorkout} onToast={showToast} />} />
           <Route path="*" element={<Navigate to="/" replace />} />
@@ -777,10 +881,25 @@ function App() {
   )
 }
 
-function ReportRoute({ allReports, onBack, onToast }: { allReports: AnalysisReport[]; onBack: () => void; onToast: (message: string) => void }) {
+function ReportRoute({ allReports, onLoaded, onBack, onToast }: { allReports: AnalysisReport[]; onLoaded: (report: AnalysisReport) => void; onBack: () => void; onToast: (message: string) => void }) {
   const { reportId } = useParams()
-  const report = allReports.find((item) => item.id === reportId)
-  return report ? <ReportDetail report={report} onBack={onBack} onToast={onToast} /> : <Navigate to="/reports" replace />
+  const cached = allReports.find((item) => item.id === reportId)
+  const [report, setReport] = useState<AnalysisReport | null>(cached ?? null)
+  const [failed, setFailed] = useState(false)
+  const fetchedRef = useRef(false)
+
+  useEffect(() => {
+    if (!reportId || cached?.source === 'demo' || fetchedRef.current) return
+    fetchedRef.current = true
+    getAnalysisReport(reportId).then((loaded) => {
+      setReport(loaded)
+      onLoaded(loaded)
+    }).catch(() => { if (!cached) setFailed(true) })
+  }, [cached, onLoaded, reportId])
+
+  if (report) return <ReportDetail report={report} onBack={onBack} onToast={onToast} />
+  if (failed) return <Navigate to="/reports" replace />
+  return <main className="route-loading"><span className="scan-line" /><p>正在加载动作报告</p></main>
 }
 
 export default App

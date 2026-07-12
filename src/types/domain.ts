@@ -13,6 +13,10 @@ export interface Metric {
 export interface Insight {
   id: string
   title: string
+  displayName?: string
+  createdAt?: string
+  trainingDate?: string
+  sourceHash?: string
   summary: string
   impact?: string
   action: string
@@ -21,6 +25,8 @@ export interface Insight {
   timestamp: string
   marker: string
   image?: string
+  clip?: string
+  clipStartSeconds?: number
 }
 
 export interface AnalysisReport {
@@ -36,6 +42,27 @@ export interface AnalysisReport {
   image: string
   confidence?: number
   quality?: string
+  swimStroke?: {
+    stroke: 'freestyle' | 'breaststroke' | 'backstroke' | 'butterfly' | 'unknown'
+    strokeName: string
+    confidence: number
+    candidates: Array<{ stroke: string; name: string; score: number }>
+    correctedByUser?: boolean
+    reusedFromSameVideo?: boolean
+  }
+  adviceNeedsReanalysis?: boolean
+  qualityAssessment?: {
+    status: 'pass' | 'limited'
+    quality: string
+    checks: { singlePerson: boolean; fullBodyCoverage: number; cameraStability: string; visibleCycles: number; view: string }
+    blockingIssues: string[]
+    suggestions: string[]
+  }
+  cycles?: Array<{ id: string; start: number; end: number; duration: number; confidence: number }>
+  prescription?: { priorityIssueId: string; reason: string; drill: string; volume: string; rest: string; focusCue: string; successCue: string }
+  pipeline?: { pipelineVersion: string; poseModelVersion: string; ruleVersion: string; promptVersion: string }
+  modelReview?: { status: 'reviewed' | 'engineering_fallback'; reason: string; evidenceValidated: boolean }
+  comparison?: { status: 'comparable' | 'not_comparable'; previousReportId?: string; improved?: string[]; remaining?: string[]; newIssues?: string[]; basis?: string; reason?: string }
   fileName?: string
   metadata?: {
     fps: number
@@ -47,7 +74,10 @@ export interface AnalysisReport {
     sampleRateFps?: number
     analysisSeconds?: number
     inferenceMaxSide?: number
+    analysisWorkers?: number
+    maxSampleFrames?: number
     bodyAxisAngleFromHorizontal?: number
+    swimStrokeConfidence?: number
     detectedFrames: number
     detectionRatio: number
     confidence: number

@@ -5,3 +5,6 @@ backend/data/
 .DS_Store
 *.local
 *.log
+.env
+.env.*
+!.env.example

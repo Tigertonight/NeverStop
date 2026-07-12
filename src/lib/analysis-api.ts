@@ -21,6 +21,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     const body = await response.json().catch(() => null) as { detail?: string } | null
     throw new AnalysisApiError(body?.detail ?? '分析服务请求失败，请稍后重试。', response.status)
   }
+  if (response.status === 204) return undefined as T
   return response.json() as Promise<T>
 }
 
@@ -37,4 +38,24 @@ export function getAnalysisJob(jobId: string) {
 
 export function getAnalysisReport(reportId: string) {
   return request<AnalysisReport>(`/api/reports/${reportId}`)
+}
+
+export function getAnalysisReports() {
+  return request<AnalysisReport[]>('/api/reports')
+}
+
+export function correctSwimStroke(reportId: string, stroke: 'freestyle' | 'breaststroke' | 'backstroke' | 'butterfly') {
+  return request<AnalysisReport>(`/api/reports/${reportId}/stroke`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ stroke }) })
+}
+
+export function submitInsightFeedback(reportId: string, insightId: string, value: 'accurate' | 'inaccurate' | 'unclear' | 'not_visible' | 'not_suitable') {
+  return request<{ id: string }>(`/api/reports/${reportId}/feedback`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ insightId, value }) })
+}
+
+export function updateAnalysisReport(reportId: string, input: { displayName: string; trainingDate: string }) {
+  return request<AnalysisReport>(`/api/reports/${reportId}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) })
+}
+
+export async function deleteAnalysisReport(reportId: string) {
+  await request<{ deleted: boolean }>(`/api/reports/${reportId}`, { method: 'DELETE' })
 }
