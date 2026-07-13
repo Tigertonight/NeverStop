@@ -12,3 +12,4 @@ __pycache__/
 !.env.example
 # 本机专属评测清单（含绝对路径与授权片段引用，不入库）
 backend/eval/manifest.json
+backend/eval/ablation_report.json
