@@ -131,7 +131,7 @@ function App() {
           <Route path="/analyze" element={<AnalyzeView onReportReady={saveReport} onOpenReport={openReport} />} />
           <Route path="/reports" element={<ReportsView allReports={allReports} onOpenReport={openReport} onUpdateReport={updateReportRecord} onDeleteReport={deleteReportRecord} onBack={() => navigate('/progress')} />} />
           <Route path="/reports/:reportId" element={<ReportRoute allReports={allReports} onLoaded={saveReport} onBack={() => navigate('/reports')} onToast={showToast} onReanalyze={reanalyzeExisting} />} />
-          <Route path="/progress" element={<ProgressView onOpenReports={() => navigate('/reports')} />} />
+          <Route path="/progress" element={<ProgressView allReports={allReports} onOpenReports={() => navigate('/reports')} />} />
           <Route path="/me" element={<ProfileView workouts={workouts} onSaveWorkout={saveWorkout} onToast={showToast} />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>

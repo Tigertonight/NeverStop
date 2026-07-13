@@ -1,9 +1,10 @@
 import { useState, type FormEvent } from 'react'
-import { Activity, ChevronRight, Link2, LockKeyhole, Plus, ShieldCheck, Upload, X } from 'lucide-react'
+import { Activity, BarChart3, ChevronRight, Link2, LockKeyhole, Plus, ShieldCheck, Upload, X } from 'lucide-react'
 import { SectionHeading, TopBar, WorkoutRow } from '../components/ui'
 import { useModalDismiss } from '../hooks/useModalDismiss'
 import { todayValue } from '../lib/format'
 import { dataSources } from '../data/demo'
+import { getFeedbackStats, type FeedbackStats } from '../lib/analysis-api'
 import type { ManualRecordInput, Sport, WorkoutRecord } from '../types/domain'
 
 function ManualRecordModal({ onClose, onSave }: { onClose: () => void; onSave: (input: ManualRecordInput) => void }) {
@@ -49,7 +50,21 @@ function ManualRecordModal({ onClose, onSave }: { onClose: () => void; onSave: (
 
 export function ProfileView({ workouts, onSaveWorkout, onToast }: { workouts: WorkoutRecord[]; onSaveWorkout: (input: ManualRecordInput) => void; onToast: (message: string) => void }) {
   const [showManual, setShowManual] = useState(false)
+  const [stats, setStats] = useState<FeedbackStats | null>(null)
+  const [loadingStats, setLoadingStats] = useState(false)
   const sourceLabel = { native_required: '需 App', web_oauth: '可规划', planned: '规划中' } as const
+
+  const loadStats = async () => {
+    setLoadingStats(true)
+    try {
+      setStats(await getFeedbackStats())
+    } catch (error) {
+      onToast(error instanceof Error ? error.message : '暂时无法读取反馈统计')
+    } finally {
+      setLoadingStats(false)
+    }
+  }
+
   return (
     <div className="view profile-view">
       <TopBar title="我的" />
@@ -64,6 +79,26 @@ export function ProfileView({ workouts, onSaveWorkout, onToast }: { workouts: Wo
         </div></section>
         <section className="workout-records"><SectionHeading title="本地运动记录" />
           {workouts.length === 0 ? <div className="empty-state"><span><Activity size={22} /></span><div><strong>还没有记录</strong><p>添加第一场跑步或游泳，刷新页面也会保留。</p></div><button className="secondary-button compact" onClick={() => setShowManual(true)}>添加记录</button></div> : <div className="workout-list">{workouts.map((workout) => <WorkoutRow key={workout.id} workout={workout} />)}</div>}
+        </section>
+        <section className="feedback-diagnostics"><SectionHeading title="建议反馈诊断" action={<span className="section-note">用于调参</span>} />
+          {stats === null ? (
+            <button className="secondary-button compact" onClick={loadStats} disabled={loadingStats}><BarChart3 size={16} /> {loadingStats ? '加载中…' : '查看反馈统计'}</button>
+          ) : stats.total === 0 ? (
+            <p className="section-note">还没有收到任何建议反馈。用户在报告里标注「准确/不准确」后，这里会汇总各类建议的不满意率，帮助定位需要复查的规则。</p>
+          ) : (
+            <div className="diagnostics-body">
+              <p className="section-note">共 {stats.total} 条反馈 · 整体不满意率 {(stats.overallInaccurateRate * 100).toFixed(0)}%（按不满意率排序，越高越需复查）</p>
+              <ul className="diagnostics-list">
+                {stats.byInsight.map((row) => (
+                  <li key={row.insightId} className={row.inaccurateRate >= 0.5 ? 'flag' : ''}>
+                    <span className="diagnostics-id">{row.insightId}</span>
+                    <span className="diagnostics-bar"><i style={{ width: `${row.inaccurateRate * 100}%` }} /></span>
+                    <span className="diagnostics-rate">{(row.inaccurateRate * 100).toFixed(0)}%<small> · {row.total} 条</small></span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
         </section>
       </main>
       {showManual ? <ManualRecordModal onClose={() => setShowManual(false)} onSave={(input) => { onSaveWorkout(input); setShowManual(false) }} /> : null}

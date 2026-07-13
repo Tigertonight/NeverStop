@@ -72,3 +72,14 @@ export function updateAnalysisReport(reportId: string, input: { displayName: str
 export async function deleteAnalysisReport(reportId: string) {
   await request<{ deleted: boolean }>(`/api/reports/${reportId}`, { method: 'DELETE' })
 }
+
+export interface FeedbackStats {
+  total: number
+  overallInaccurateRate: number
+  byValue: Record<string, number>
+  byInsight: Array<{ insightId: string; total: number; accurate: number; negative: number; inaccurateRate: number }>
+}
+
+export function getFeedbackStats() {
+  return request<FeedbackStats>('/api/feedback/stats')
+}

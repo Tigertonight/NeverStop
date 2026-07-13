@@ -118,18 +118,31 @@ def _archived_source_path(source_hash: str) -> Path | None:
     return matches[0] if matches else None
 
 
-def _prune_source_videos(keep: Path | None = None) -> None:
-    """只保留用户最近一次上传的源视频，删除 SOURCE_DIR 下其它所有归档。"""
+def _referenced_source_hashes() -> set[str]:
+    """当前仍被任何报告引用的 sourceHash 集合（这些源视频需保留以支持重新分析）。"""
+    with state_lock:
+        return {str(item.get("sourceHash")) for item in reports.values() if item.get("sourceHash")}
+
+
+def _prune_source_videos(keep_hashes: set[str] | None = None) -> None:
+    """删除不再被任何报告引用的源视频，回收磁盘。
+
+    保留策略：只要某个 sourceHash 仍被至少一份报告引用，其源视频就保留，
+    以支持对历史报告的「重新分析」；无引用的归档才清理。
+    """
+    keep = _referenced_source_hashes()
+    if keep_hashes:
+        keep |= keep_hashes
     for existing in SOURCE_DIR.glob("*"):
         if not existing.is_file():
             continue
-        if keep is not None and existing == keep:
+        if existing.stem in keep:
             continue
         existing.unlink(missing_ok=True)
 
 
 def _archive_source_video(upload_path: Path, source_hash: str) -> None:
-    """分析成功后归档源视频；只保留最近一次上传的视频，清理其它旧归档。"""
+    """分析成功后归档源视频；保留仍被报告引用的所有源视频，清理无引用的旧归档。"""
     if not source_hash or not upload_path.exists():
         upload_path.unlink(missing_ok=True)
         _prune_source_videos()
@@ -137,7 +150,7 @@ def _archive_source_video(upload_path: Path, source_hash: str) -> None:
     target = SOURCE_DIR / f"{source_hash}{upload_path.suffix.lower()}"
     if target.exists():
         upload_path.unlink(missing_ok=True)
-        _prune_source_videos(keep=target)
+        _prune_source_videos(keep_hashes={source_hash})
         return
     try:
         shutil.move(str(upload_path), str(target))
@@ -146,7 +159,52 @@ def _archive_source_video(upload_path: Path, source_hash: str) -> None:
         upload_path.unlink(missing_ok=True)
         _prune_source_videos()
         return
-    _prune_source_videos(keep=target)
+    _prune_source_videos(keep_hashes={source_hash})
+
+
+def _compare_measurements(previous: dict, current: dict) -> list[dict]:
+    """对比两份报告的关键测量值，输出每项数值变化与「变好/变差」判断。
+
+    只有当运动/泳姿一致时才由调用方触发；这里按 keyMeasurements 逐项算 delta，
+    并结合 betterWhen（lower/higher/range+target）判断趋势方向。
+    """
+    prev = previous.get("keyMeasurements") or {}
+    curr = current.get("keyMeasurements") or {}
+    trends: list[dict] = []
+    for key, cur_item in curr.items():
+        prev_item = prev.get(key)
+        if not isinstance(cur_item, dict) or not isinstance(prev_item, dict):
+            continue
+        try:
+            cur_val = float(cur_item["value"])
+            prev_val = float(prev_item["value"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        delta = round(cur_val - prev_val, 4)
+        better_when = cur_item.get("betterWhen", "lower")
+        # 判断方向：忽略极小变化（相对<3%）视为持平
+        denom = abs(prev_val) if abs(prev_val) > 1e-6 else 1.0
+        if abs(delta) / denom < 0.03:
+            direction = "stable"
+        elif better_when == "lower":
+            direction = "improved" if delta < 0 else "regressed"
+        elif better_when == "higher":
+            direction = "improved" if delta > 0 else "regressed"
+        elif better_when == "range":
+            target = float(cur_item.get("target", prev_val))
+            direction = "improved" if abs(cur_val - target) < abs(prev_val - target) else "regressed"
+        else:
+            direction = "changed"
+        trends.append({
+            "key": key,
+            "label": cur_item.get("label", key),
+            "unit": cur_item.get("unit", ""),
+            "previous": prev_val,
+            "current": cur_val,
+            "delta": delta,
+            "direction": direction,
+        })
+    return trends
 
 
 def _process_job(job_id: str, report_id: str, upload_path: Path, file_name: str, sport: str, source_hash: str, swim_stroke_hint: str | None) -> None:
@@ -184,9 +242,11 @@ def _process_job(job_id: str, report_id: str, upload_path: Path, file_name: str,
             report["comparison"] = {
                 "status": "comparable",
                 "previousReportId": previous["id"],
+                "previousDate": previous.get("trainingDate") or previous.get("createdAt"),
                 "improved": sorted(previous_issues - current_issues),
                 "remaining": sorted(previous_issues & current_issues),
                 "newIssues": sorted(current_issues - previous_issues),
+                "metricTrends": _compare_measurements(previous, report),
                 "basis": "同一泳姿、均包含至少两个可见动作周期",
             }
         else:
@@ -385,6 +445,8 @@ def delete_report(report_id: str) -> dict:
             raise HTTPException(status_code=404, detail="报告不存在。")
         del reports[report_id]
     shutil.rmtree(REPORT_DIR / report_id, ignore_errors=True)
+    # 删报告后回收不再被任何报告引用的源视频（避免磁盘无限累积）
+    _prune_source_videos()
     return {"deleted": True, "reportId": report_id}
 
 
@@ -475,3 +537,61 @@ def create_report_feedback(report_id: str, feedback: ReportFeedback) -> dict:
         with FEEDBACK_FILE.open("a", encoding="utf-8") as destination:
             destination.write(json.dumps(record, ensure_ascii=False) + "\n")
     return record
+
+
+@app.get("/api/feedback/stats")
+def feedback_stats() -> dict:
+    """聚合已收集的用户反馈，闭环利用：暴露每类建议(insightId)的
+    准确/不准确比例，用于定位「哪些规则最常被用户判为不准」以指导调参。
+
+    negativeValues（inaccurate/unclear/not_visible/not_suitable）计为「不满意」，
+    accurate 计为「满意」。inaccurateRate 越高说明该建议越需要人工复查。
+    """
+    negative_values = {"inaccurate", "unclear", "not_visible", "not_suitable"}
+    if not FEEDBACK_FILE.exists():
+        return {"total": 0, "byInsight": [], "byValue": {}, "overallInaccurateRate": 0.0}
+
+    by_insight: dict[str, dict[str, int]] = {}
+    by_value: dict[str, int] = {}
+    total = 0
+    negatives = 0
+    for line in FEEDBACK_FILE.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        insight_id = str(record.get("insightId") or "unknown")
+        value = str(record.get("value") or "unknown")
+        total += 1
+        by_value[value] = by_value.get(value, 0) + 1
+        bucket = by_insight.setdefault(insight_id, {"total": 0, "accurate": 0, "negative": 0})
+        bucket["total"] += 1
+        if value == "accurate":
+            bucket["accurate"] += 1
+        elif value in negative_values:
+            bucket["negative"] += 1
+            negatives += 1
+
+    by_insight_rows = sorted(
+        (
+            {
+                "insightId": insight_id,
+                "total": stats["total"],
+                "accurate": stats["accurate"],
+                "negative": stats["negative"],
+                "inaccurateRate": round(stats["negative"] / stats["total"], 3) if stats["total"] else 0.0,
+            }
+            for insight_id, stats in by_insight.items()
+        ),
+        key=lambda row: (row["inaccurateRate"], row["total"]),
+        reverse=True,
+    )
+    return {
+        "total": total,
+        "byValue": by_value,
+        "byInsight": by_insight_rows,
+        "overallInaccurateRate": round(negatives / total, 3) if total else 0.0,
+    }

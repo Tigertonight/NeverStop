@@ -311,18 +311,22 @@ class ReportApiTest(unittest.TestCase):
         response = self.client.post("/api/reports/ghost/reanalyze", json={})
         self.assertEqual(response.status_code, 404)
 
-    def test_archive_keeps_only_latest_source_video(self) -> None:
-        # 归档新视频时应删除之前留下的所有旧源视频，只保留最近一次上传的。
-        (self._source_dir / "oldhash1.mp4").write_bytes(b"old-1")
-        (self._source_dir / "oldhash2.mov").write_bytes(b"old-2")
+    def test_archive_prunes_unreferenced_but_keeps_referenced(self) -> None:
+        # 归档新视频时，删除无报告引用的旧源视频，但保留仍被报告引用的。
+        referenced = _sample_report("keep-me", sport="swimming")
+        referenced["sourceHash"] = "refhash"
+        self._seed(referenced)
+        (self._source_dir / "refhash.mp4").write_bytes(b"referenced")   # 被 keep-me 引用
+        (self._source_dir / "orphanhash.mov").write_bytes(b"orphan")    # 无报告引用
         staged = self._upload_dir / "job-new.mp4"
         staged.write_bytes(b"newest")
 
         main._archive_source_video(staged, "newhash")
 
         remaining = sorted(p.name for p in self._source_dir.glob("*"))
-        self.assertEqual(remaining, ["newhash.mp4"])
-        self.assertFalse(staged.exists())  # 临时文件已被移动
+        # 新归档 + 被引用的都保留，孤儿被清理
+        self.assertEqual(remaining, ["newhash.mp4", "refhash.mp4"])
+        self.assertFalse(staged.exists())
 
     def test_reanalyze_same_video_keeps_its_source(self) -> None:
         # 重新分析用的是同一视频(同 hash)，归档时不应把自己删掉。
@@ -336,8 +340,64 @@ class ReportApiTest(unittest.TestCase):
         remaining = sorted(p.name for p in self._source_dir.glob("*"))
         self.assertEqual(remaining, ["samehash.mp4"])
 
-    # ---- feedback -----------------------------------------------------
+    def test_delete_report_reclaims_orphan_source(self) -> None:
+        # 删掉唯一引用某源视频的报告后，该源视频应被回收。
+        report = _sample_report("del-me", sport="swimming")
+        report["sourceHash"] = "delhash"
+        self._seed(report)
+        src = self._source_dir / "delhash.mp4"
+        src.write_bytes(b"video")
 
+        self.client.delete("/api/reports/del-me")
+
+        self.assertFalse(src.exists())
+
+    def test_delete_report_keeps_source_still_referenced(self) -> None:
+        # 两份报告共享同一源视频，删其一后源视频仍应保留（另一份还要用）。
+        a = _sample_report("share-a", sport="swimming")
+        b = _sample_report("share-b", sport="swimming")
+        a["sourceHash"] = b["sourceHash"] = "sharedhash"
+        self._seed(a)
+        self._seed(b)
+        src = self._source_dir / "sharedhash.mp4"
+        src.write_bytes(b"video")
+
+        self.client.delete("/api/reports/share-a")
+
+        self.assertTrue(src.exists())  # share-b 仍引用
+
+    # ---- measurement trend comparison ---------------------------------
+
+    def test_compare_measurements_directions(self) -> None:
+        prev = {"keyMeasurements": {
+            "headDeviation": {"value": 0.40, "betterWhen": "lower", "label": "头位偏离", "unit": ""},
+            "kneeFlexion": {"value": 50.0, "betterWhen": "lower", "label": "打腿膝屈曲", "unit": "°"},
+            "torsoLean": {"value": 4.0, "betterWhen": "range", "target": 10.0, "label": "躯干前倾", "unit": "°"},
+        }}
+        curr = {"keyMeasurements": {
+            "headDeviation": {"value": 0.30, "betterWhen": "lower", "label": "头位偏离", "unit": ""},   # 下降=改善
+            "kneeFlexion": {"value": 60.0, "betterWhen": "lower", "label": "打腿膝屈曲", "unit": "°"},   # 上升=退步
+            "torsoLean": {"value": 9.0, "betterWhen": "range", "target": 10.0, "label": "躯干前倾", "unit": "°"},  # 更接近目标=改善
+        }}
+        trends = {t["key"]: t for t in main._compare_measurements(prev, curr)}
+        self.assertEqual(trends["headDeviation"]["direction"], "improved")
+        self.assertEqual(trends["kneeFlexion"]["direction"], "regressed")
+        self.assertEqual(trends["torsoLean"]["direction"], "improved")
+        self.assertAlmostEqual(trends["headDeviation"]["delta"], -0.10, places=4)
+
+    def test_compare_measurements_stable_when_tiny_change(self) -> None:
+        prev = {"keyMeasurements": {"kneeFlexion": {"value": 50.0, "betterWhen": "lower", "label": "x", "unit": "°"}}}
+        curr = {"keyMeasurements": {"kneeFlexion": {"value": 50.5, "betterWhen": "lower", "label": "x", "unit": "°"}}}
+        trends = main._compare_measurements(prev, curr)
+        self.assertEqual(trends[0]["direction"], "stable")  # 相对变化<3%
+
+    def test_compare_measurements_handles_missing(self) -> None:
+        # 上一份没有该测量值时应跳过，不报错。
+        prev = {"keyMeasurements": {}}
+        curr = {"keyMeasurements": {"kneeFlexion": {"value": 50.0, "betterWhen": "lower", "label": "x", "unit": "°"}}}
+        self.assertEqual(main._compare_measurements(prev, curr), [])
+
+    # ---- feedback -----------------------------------------------------
     def test_feedback_is_appended_to_file(self) -> None:
         self._seed(_sample_report("fb-me"))
         response = self.client.post(
@@ -368,6 +428,32 @@ class ReportApiTest(unittest.TestCase):
             json={"insightId": "insight-a", "value": "accurate"},
         )
         self.assertEqual(response.status_code, 404)
+
+    def test_feedback_stats_empty(self) -> None:
+        response = self.client.get("/api/feedback/stats")
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["total"], 0)
+        self.assertEqual(body["byInsight"], [])
+        self.assertEqual(body["overallInaccurateRate"], 0.0)
+
+    def test_feedback_stats_aggregates_and_ranks(self) -> None:
+        self._seed(_sample_report("fb-stats"))
+        # insight-a 被多次标记：1 准确 + 3 不满意 -> inaccurateRate=0.75
+        for value in ("accurate", "inaccurate", "unclear", "not_visible"):
+            resp = self.client.post("/api/reports/fb-stats/feedback", json={"insightId": "insight-a", "value": value})
+            self.assertEqual(resp.status_code, 201)
+
+        body = self.client.get("/api/feedback/stats").json()
+        self.assertEqual(body["total"], 4)
+        self.assertEqual(body["byValue"]["inaccurate"], 1)
+        self.assertEqual(body["byValue"]["accurate"], 1)
+        row = next(r for r in body["byInsight"] if r["insightId"] == "insight-a")
+        self.assertEqual(row["total"], 4)
+        self.assertEqual(row["accurate"], 1)
+        self.assertEqual(row["negative"], 3)
+        self.assertEqual(row["inaccurateRate"], 0.75)
+        self.assertEqual(body["overallInaccurateRate"], 0.75)
 
     # ---- job lifecycle ------------------------------------------------
 
