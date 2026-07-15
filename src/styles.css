@@ -321,6 +321,25 @@ h1, h2, h3, p { margin: 0; text-wrap: pretty; }
 .comparison-summary { margin-top: 14px; padding: 16px 2px; border-top: 1px solid var(--line); }
 .comparison-summary h2 { margin: 6px 0; font-size: 15px; }
 .comparison-summary p { color: var(--ink-muted); font-size: 12px; line-height: 1.55; }
+.metric-trends { list-style: none; margin: 12px 0 0; padding: 0; display: grid; gap: 8px; }
+.metric-trend { display: grid; grid-template-columns: 1fr auto auto; align-items: center; gap: 10px; padding: 10px 12px; border-radius: 12px; background: var(--surface-muted, #f6f7f9); font-size: 12px; }
+.metric-trend-label { color: var(--ink); font-weight: 600; }
+.metric-trend-values { color: var(--ink-muted); font-variant-numeric: tabular-nums; }
+.metric-trend-values strong { color: var(--ink); }
+.metric-trend-badge { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
+.metric-trend.up .metric-trend-badge { color: #0a7d38; background: rgba(10, 125, 56, 0.12); }
+.metric-trend.down .metric-trend-badge { color: #b4381c; background: rgba(180, 56, 28, 0.12); }
+.metric-trend.flat .metric-trend-badge { color: var(--ink-muted); background: var(--hairline, rgba(0,0,0,0.06)); }
+.feedback-diagnostics { margin-top: 20px; }
+.diagnostics-body { margin-top: 10px; }
+.diagnostics-list { list-style: none; margin: 10px 0 0; padding: 0; display: grid; gap: 8px; }
+.diagnostics-list li { display: grid; grid-template-columns: minmax(70px, auto) 1fr auto; align-items: center; gap: 10px; font-size: 12px; }
+.diagnostics-id { color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+.diagnostics-bar { height: 8px; border-radius: 999px; background: var(--hairline, rgba(0,0,0,0.06)); overflow: hidden; }
+.diagnostics-bar i { display: block; height: 100%; background: var(--brand); border-radius: 999px; }
+.diagnostics-list li.flag .diagnostics-bar i { background: #b4381c; }
+.diagnostics-rate { color: var(--ink-muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.diagnostics-rate small { color: var(--ink-subtle); }
 .route-loading { min-height: 65vh; display: grid; place-items: center; align-content: center; gap: 16px; color: var(--ink-muted); }
 .route-loading .scan-line { position: static; width: 96px; height: 3px; background: var(--brand); animation: scan 1.2s ease-in-out infinite alternate; }
 .report-disclaimer { margin-top: 18px; color: var(--ink-subtle); font-size: 10px; line-height: 1.5; text-align: center; }
@@ -336,6 +355,8 @@ h1, h2, h3, p { margin: 0; text-wrap: pretty; }
 .score-change { display: flex; align-items: end; gap: 12px; margin: 8px 0 20px; }
 .score-change strong { font-size: 44px; line-height: 1; }
 .score-change span { display: flex; align-items: center; gap: 4px; padding-bottom: 5px; color: var(--positive); font-size: 12px; font-weight: 700; }
+.score-change span.down { color: var(--warning, #b4381c); }
+.progress-note { display: block; margin-top: 4px; color: var(--ink-subtle); font-size: 11px; line-height: 1.5; }
 .line-chart { height: 176px; }
 .line-chart svg { width: 100%; height: 142px; overflow: visible; }
 .line-chart line { stroke: var(--hairline); stroke-width: 0.5; vector-effect: non-scaling-stroke; }
@@ -446,3 +467,45 @@ h1, h2, h3, p { margin: 0; text-wrap: pretty; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
 }
+
+.app-error { min-height: 100vh; display: grid; place-items: center; padding: 24px; }
+.app-error-card { max-width: 420px; width: 100%; text-align: center; background: var(--surface, #fff); border-radius: 20px; padding: 32px 24px; box-shadow: 0 12px 40px rgba(15, 23, 42, 0.12); }
+.app-error-card h1 { margin: 0 0 8px; font-size: 20px; }
+.app-error-card p { margin: 0 0 12px; color: var(--muted, #64748b); }
+.app-error-detail { display: block; margin-bottom: 20px; font-size: 12px; color: var(--muted, #94a3b8); word-break: break-word; }
+.app-error-actions { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
+
+/* ---- 应用内确认弹窗 (F1) ---- */
+.confirm-backdrop { align-items: center; padding: 24px; }
+.confirm-sheet { width: min(100%, 380px); padding: 24px 22px calc(22px + env(safe-area-inset-bottom)); text-align: center; background: var(--surface); border-radius: 14px; box-shadow: 0 18px 52px rgba(0,0,0,0.4); animation: sheet-in 200ms ease-out; }
+.confirm-icon { width: 48px; height: 48px; margin: 0 auto 14px; display: grid; place-items: center; border-radius: 50%; }
+.confirm-icon.danger { color: var(--negative); background: rgba(243,114,127,0.12); }
+.confirm-icon.primary { color: var(--brand); background: rgba(30,215,96,0.12); }
+.confirm-sheet h2 { font-size: 17px; line-height: 1.4; }
+.confirm-desc { margin-top: 8px; color: var(--ink-muted); font-size: 13px; line-height: 1.55; }
+.confirm-actions { display: flex; gap: 10px; margin-top: 20px; }
+.confirm-actions .secondary-button, .confirm-actions .primary-button, .confirm-actions .danger-button { flex: 1; margin-top: 0; }
+
+/* ---- 报告搜索与日期分组 (F2) ---- */
+.report-search { display: flex; align-items: center; gap: 9px; margin-top: 16px; padding: 0 13px; height: 46px; color: var(--ink-muted); background: var(--surface-raised); border: 1px solid var(--hairline); border-radius: 999px; }
+.report-search svg { flex: 0 0 auto; }
+.report-search input { flex: 1; min-width: 0; height: 100%; color: var(--ink); background: transparent; border: none; outline: none; font-size: 14px; }
+.report-search input::placeholder { color: var(--ink-subtle); }
+.report-search .icon-button { flex: 0 0 auto; }
+.report-group { margin-bottom: 22px; }
+.report-group-title { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; color: var(--ink-muted); font-size: 13px; font-weight: 750; }
+.report-group-title span { display: inline-grid; place-items: center; min-width: 20px; height: 20px; padding: 0 6px; color: var(--ink-subtle); background: var(--surface-raised); border-radius: 999px; font-size: 11px; }
+
+/* ---- 分析失败与重试 (F3) ---- */
+.analysis-failure { display: flex; align-items: flex-start; gap: 9px; margin-top: 12px; padding: 12px; border-radius: var(--radius); font-size: 12px; line-height: 1.55; }
+.analysis-failure svg { flex: 0 0 auto; margin-top: 1px; }
+.analysis-failure strong { display: block; font-size: 13px; }
+.analysis-failure p { margin-top: 3px; color: var(--ink-muted); }
+.analysis-failure.connection { color: #ffd166; background: rgba(255,209,102,0.09); border-left: 3px solid #ffd166; }
+.analysis-failure.server { color: var(--negative); background: rgba(243,114,127,0.1); border-left: 3px solid var(--negative); }
+.analysis-failure.rejected { color: var(--ink); background: var(--surface-raised); border-left: 3px solid var(--hairline-strong); }
+
+/* ---- 泳姿修正后引导重新分析 (F5) ---- */
+.quality-warning.reanalyze { flex-direction: row; }
+.quality-warning.reanalyze .secondary-button { margin-top: 10px; color: var(--ink); }
+

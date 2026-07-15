@@ -116,13 +116,19 @@ def _video_metadata(path: Path) -> tuple[cv2.VideoCapture, float, int, int, int,
     return capture, fps, frame_count, width, height, duration
 
 
+def _default_sample_fps(duration: float) -> float:
+    """按时长自适应的目标采样帧率（越长的视频抽得越稀，兼顾精度与耗时）。"""
+    return 10.0 if duration <= 30 else 8.0 if duration <= 60 else 5.0
+
+
 def _extract_pose_frames(
     path: Path,
     progress: ProgressCallback,
+    sample_fps_override: float | None = None,
 ) -> tuple[list[PoseFrame], dict[str, float]]:
     capture, fps, frame_count, width, height, duration = _video_metadata(path)
     capture.release()
-    target_sample_fps = min(10.0 if duration <= 30 else 8.0 if duration <= 60 else 5.0, fps)
+    target_sample_fps = min(sample_fps_override or _default_sample_fps(duration), fps)
     sample_count = min(600, max(40, int(math.ceil(duration * target_sample_fps))))
     indices = np.unique(np.linspace(0, frame_count - 1, sample_count, dtype=np.int32))
     pose_frames: list[PoseFrame] = []
@@ -197,6 +203,7 @@ def _extract_pose_frames(
         "durationSeconds": duration,
         "sampledFrames": len(indices),
         "sampleRateFps": len(indices) / duration,
+        "targetSampleFps": target_sample_fps,
         "detectedFrames": len(pose_frames),
         "detectionRatio": detection_ratio,
         "confidence": confidence,
@@ -946,6 +953,12 @@ def _running_report(
         "summary": f"我们在多个跑步动作时刻都观察到了这一点。{primary_summary}",
         "image": media_url,
         "metadata": metadata,
+        "keyMeasurements": {
+            "torsoLean": {"value": round(float(lean), 2), "unit": "°", "label": "躯干前倾", "betterWhen": "range", "target": 10.0},
+            "ankleOffsetRatio": {"value": round(float(ankle_offset), 4), "unit": "%身高", "label": "脚踝前伸", "betterWhen": "lower"},
+            "kneeDifference": {"value": round(float(knee_difference), 2), "unit": "°", "label": "左右膝角差", "betterWhen": "lower"},
+            "armDifference": {"value": round(float(arm_difference), 2), "unit": "°", "label": "摆臂差异", "betterWhen": "lower"},
+        },
         "metrics": [
             {"label": "躯干前倾", "value": f"{lean:.1f}", "unit": "°", "delta": "由肩髋轴计算", "tone": "neutral"},
             {"label": "脚踝前伸", "value": f"{ankle_offset * 100:.0f}", "unit": "%身高", "delta": "无实物标尺", "tone": "warning" if ankle_offset > 0.3 else "positive"},
@@ -1067,6 +1080,12 @@ def _swimming_report(
         "image": media_url,
         "metadata": metadata,
         "swimStroke": stroke_result,
+        "keyMeasurements": {
+            "headDeviation": {"value": round(float(head_deviation), 4), "unit": "", "label": "头位偏离", "betterWhen": "lower"},
+            "bodyIssue": {"value": round(float(body_issue), 4), "unit": "", "label": "身体线下沉", "betterWhen": "lower"},
+            "frontArmDrop": {"value": round(float(front_arm_drop), 4), "unit": "", "label": "前手下压", "betterWhen": "lower"},
+            "kneeFlexion": {"value": round(float(knee_flexion), 2), "unit": "°", "label": "打腿膝屈曲", "betterWhen": "lower"},
+        },
         "metrics": [
             {"label": "头位", "value": "需改进" if head_problem else "稳定" if head_reliable else "待补拍", "unit": "", "delta": "跨多个呼吸动作", "tone": "warning" if head_problem else "positive" if head_reliable else "neutral"},
             {"label": "身体线", "value": "需改进" if body_problem else "稳定" if body_reliable else "待补拍", "unit": "", "delta": "肩髋脚整体趋势", "tone": "warning" if body_problem else "positive" if body_reliable else "neutral"},

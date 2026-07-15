@@ -3,6 +3,15 @@ import type { AnalysisReport, Sport } from '../types/domain'
 
 const API_BASE = (import.meta.env.VITE_ANALYSIS_API_URL ?? 'http://127.0.0.1:8000').replace(/\/$/, '')
 
+/** 分析服务主机名（含端口），用于向用户展示视频发往何处。 */
+export function analysisApiHost(): string {
+  try {
+    return new URL(API_BASE).host
+  } catch {
+    return API_BASE
+  }
+}
+
 export class AnalysisApiError extends Error {
   constructor(message: string, public status?: number) {
     super(message)
@@ -48,6 +57,10 @@ export function correctSwimStroke(reportId: string, stroke: 'freestyle' | 'breas
   return request<AnalysisReport>(`/api/reports/${reportId}/stroke`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ stroke }) })
 }
 
+export function reanalyzeReport(reportId: string, swimStroke?: 'freestyle' | 'breaststroke' | 'backstroke' | 'butterfly') {
+  return request<AnalysisJob>(`/api/reports/${reportId}/reanalyze`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(swimStroke ? { swimStroke } : {}) })
+}
+
 export function submitInsightFeedback(reportId: string, insightId: string, value: 'accurate' | 'inaccurate' | 'unclear' | 'not_visible' | 'not_suitable') {
   return request<{ id: string }>(`/api/reports/${reportId}/feedback`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ insightId, value }) })
 }
@@ -58,4 +71,15 @@ export function updateAnalysisReport(reportId: string, input: { displayName: str
 
 export async function deleteAnalysisReport(reportId: string) {
   await request<{ deleted: boolean }>(`/api/reports/${reportId}`, { method: 'DELETE' })
+}
+
+export interface FeedbackStats {
+  total: number
+  overallInaccurateRate: number
+  byValue: Record<string, number>
+  byInsight: Array<{ insightId: string; total: number; accurate: number; negative: number; inaccurateRate: number }>
+}
+
+export function getFeedbackStats() {
+  return request<FeedbackStats>('/api/feedback/stats')
 }

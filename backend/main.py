@@ -17,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from backend.analyzer import AnalysisError, analyze_video
-from backend.model_review import review_report
+from backend.model_review import review_provider, review_report
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -41,12 +41,13 @@ _load_project_env(ROOT / ".env")
 
 DATA_DIR = ROOT / "backend" / "data"
 UPLOAD_DIR = DATA_DIR / "uploads"
+SOURCE_DIR = DATA_DIR / "sources"
 REPORT_DIR = DATA_DIR / "reports"
 FEEDBACK_FILE = DATA_DIR / "feedback.jsonl"
 MAX_UPLOAD_BYTES = 300 * 1024 * 1024
 PUBLIC_API_URL = os.getenv("NEVERSTOP_PUBLIC_API_URL", "http://127.0.0.1:8000").rstrip("/")
 
-for directory in (UPLOAD_DIR, REPORT_DIR):
+for directory in (UPLOAD_DIR, SOURCE_DIR, REPORT_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title="NeverStop Analysis API", version="0.1.0")
@@ -59,7 +60,7 @@ app.add_middleware(
         "http://localhost:5173",
     ],
     allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 app.mount("/media", StaticFiles(directory=REPORT_DIR), name="media")
@@ -89,6 +90,10 @@ class StrokeCorrection(BaseModel):
     stroke: Literal["freestyle", "breaststroke", "backstroke", "butterfly"]
 
 
+class ReanalyzeRequest(BaseModel):
+    swimStroke: Literal["freestyle", "breaststroke", "backstroke", "butterfly"] | None = None
+
+
 class ReportFeedback(BaseModel):
     insightId: str
     value: Literal["accurate", "inaccurate", "unclear", "not_visible", "not_suitable"]
@@ -105,9 +110,107 @@ def _update_job(job_id: str, **changes) -> None:
             jobs[job_id].update(changes)
 
 
+def _archived_source_path(source_hash: str) -> Path | None:
+    """按 sourceHash 找回已归档的源视频（供重新分析复用，无需重传）。"""
+    if not source_hash:
+        return None
+    matches = sorted(SOURCE_DIR.glob(f"{source_hash}.*"))
+    return matches[0] if matches else None
+
+
+def _referenced_source_hashes() -> set[str]:
+    """当前仍被任何报告引用的 sourceHash 集合（这些源视频需保留以支持重新分析）。"""
+    with state_lock:
+        return {str(item.get("sourceHash")) for item in reports.values() if item.get("sourceHash")}
+
+
+def _prune_source_videos(keep_hashes: set[str] | None = None) -> None:
+    """删除不再被任何报告引用的源视频，回收磁盘。
+
+    保留策略：只要某个 sourceHash 仍被至少一份报告引用，其源视频就保留，
+    以支持对历史报告的「重新分析」；无引用的归档才清理。
+    """
+    keep = _referenced_source_hashes()
+    if keep_hashes:
+        keep |= keep_hashes
+    for existing in SOURCE_DIR.glob("*"):
+        if not existing.is_file():
+            continue
+        if existing.stem in keep:
+            continue
+        existing.unlink(missing_ok=True)
+
+
+def _archive_source_video(upload_path: Path, source_hash: str) -> None:
+    """分析成功后归档源视频；保留仍被报告引用的所有源视频，清理无引用的旧归档。"""
+    if not source_hash or not upload_path.exists():
+        upload_path.unlink(missing_ok=True)
+        _prune_source_videos()
+        return
+    target = SOURCE_DIR / f"{source_hash}{upload_path.suffix.lower()}"
+    if target.exists():
+        upload_path.unlink(missing_ok=True)
+        _prune_source_videos(keep_hashes={source_hash})
+        return
+    try:
+        shutil.move(str(upload_path), str(target))
+    except OSError:
+        logger.exception("Failed to archive source video for %s", source_hash)
+        upload_path.unlink(missing_ok=True)
+        _prune_source_videos()
+        return
+    _prune_source_videos(keep_hashes={source_hash})
+
+
+def _compare_measurements(previous: dict, current: dict) -> list[dict]:
+    """对比两份报告的关键测量值，输出每项数值变化与「变好/变差」判断。
+
+    只有当运动/泳姿一致时才由调用方触发；这里按 keyMeasurements 逐项算 delta，
+    并结合 betterWhen（lower/higher/range+target）判断趋势方向。
+    """
+    prev = previous.get("keyMeasurements") or {}
+    curr = current.get("keyMeasurements") or {}
+    trends: list[dict] = []
+    for key, cur_item in curr.items():
+        prev_item = prev.get(key)
+        if not isinstance(cur_item, dict) or not isinstance(prev_item, dict):
+            continue
+        try:
+            cur_val = float(cur_item["value"])
+            prev_val = float(prev_item["value"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        delta = round(cur_val - prev_val, 4)
+        better_when = cur_item.get("betterWhen", "lower")
+        # 判断方向：忽略极小变化（相对<3%）视为持平
+        denom = abs(prev_val) if abs(prev_val) > 1e-6 else 1.0
+        if abs(delta) / denom < 0.03:
+            direction = "stable"
+        elif better_when == "lower":
+            direction = "improved" if delta < 0 else "regressed"
+        elif better_when == "higher":
+            direction = "improved" if delta > 0 else "regressed"
+        elif better_when == "range":
+            target = float(cur_item.get("target", prev_val))
+            direction = "improved" if abs(cur_val - target) < abs(prev_val - target) else "regressed"
+        else:
+            direction = "changed"
+        trends.append({
+            "key": key,
+            "label": cur_item.get("label", key),
+            "unit": cur_item.get("unit", ""),
+            "previous": prev_val,
+            "current": cur_val,
+            "delta": delta,
+            "direction": direction,
+        })
+    return trends
+
+
 def _process_job(job_id: str, report_id: str, upload_path: Path, file_name: str, sport: str, source_hash: str, swim_stroke_hint: str | None) -> None:
     output_path = REPORT_DIR / report_id / "evidence.jpg"
     media_url = f"{PUBLIC_API_URL}/media/{report_id}/evidence.jpg"
+    analysis_succeeded = False
 
     def progress(value: int, stage: str) -> None:
         status = "estimating_pose" if value < 82 else "building_report"
@@ -139,9 +242,11 @@ def _process_job(job_id: str, report_id: str, upload_path: Path, file_name: str,
             report["comparison"] = {
                 "status": "comparable",
                 "previousReportId": previous["id"],
+                "previousDate": previous.get("trainingDate") or previous.get("createdAt"),
                 "improved": sorted(previous_issues - current_issues),
                 "remaining": sorted(previous_issues & current_issues),
                 "newIssues": sorted(current_issues - previous_issues),
+                "metricTrends": _compare_measurements(previous, report),
                 "basis": "同一泳姿、均包含至少两个可见动作周期",
             }
         else:
@@ -180,6 +285,7 @@ def _process_job(job_id: str, report_id: str, upload_path: Path, file_name: str,
             stage="分析完成",
             reportId=report_id,
         )
+        analysis_succeeded = True
     except AnalysisError as exc:
         _update_job(
             job_id,
@@ -200,17 +306,21 @@ def _process_job(job_id: str, report_id: str, upload_path: Path, file_name: str,
             errorMessage="分析服务出现异常，请重新尝试。",
         )
     finally:
-        upload_path.unlink(missing_ok=True)
+        if analysis_succeeded:
+            _archive_source_video(upload_path, source_hash)
+        else:
+            upload_path.unlink(missing_ok=True)
 
 
 @app.get("/api/health")
 def health() -> dict:
+    provider, configured = review_provider()
     return {
         "status": "ok",
         "analyzer": "mediapipe-pose",
         "storage": "local",
-        "reviewProvider": "minimax-direct" if (os.getenv("MINIMAX_ACCESS_TOKEN") or os.getenv("MINIMAX_API_KEY")) else "engineering-fallback",
-        "reviewConfigured": bool(os.getenv("MINIMAX_ACCESS_TOKEN") or os.getenv("MINIMAX_API_KEY")),
+        "reviewProvider": provider,
+        "reviewConfigured": configured,
     }
 
 
@@ -219,6 +329,7 @@ async def create_analysis_job(
     background_tasks: BackgroundTasks,
     sport: Literal["running", "swimming"] = Form(...),
     video: UploadFile = File(...),
+    swim_stroke: Literal["freestyle", "breaststroke", "backstroke", "butterfly"] | None = Form(default=None),
 ) -> dict:
     file_name = video.filename or "training-video"
     suffix = Path(file_name).suffix.lower()
@@ -251,7 +362,10 @@ async def create_analysis_job(
     source_hash = digest.hexdigest()
     with state_lock:
         same_video = next((item for item in reversed(list(reports.values())) if item.get("sourceHash") == source_hash), None)
-    swim_stroke_hint = same_video.get("swimStroke", {}).get("stroke") if same_video and sport == "swimming" else None
+    swim_stroke_hint = None
+    if sport == "swimming":
+        # 用户显式指定的泳姿优先；否则沿用同一视频历史报告的泳姿
+        swim_stroke_hint = swim_stroke or (same_video.get("swimStroke", {}).get("stroke") if same_video else None)
     job = {
         "id": job_id,
         "sport": sport,
@@ -331,6 +445,8 @@ def delete_report(report_id: str) -> dict:
             raise HTTPException(status_code=404, detail="报告不存在。")
         del reports[report_id]
     shutil.rmtree(REPORT_DIR / report_id, ignore_errors=True)
+    # 删报告后回收不再被任何报告引用的源视频（避免磁盘无限累积）
+    _prune_source_videos()
     return {"deleted": True, "reportId": report_id}
 
 
@@ -349,6 +465,57 @@ def correct_report_stroke(report_id: str, correction: StrokeCorrection) -> dict:
         stored = dict(report)
     (REPORT_DIR / report_id / "report.json").write_text(json.dumps(stored, ensure_ascii=False, indent=2), encoding="utf-8")
     return stored
+
+
+@app.post("/api/reports/{report_id}/reanalyze", status_code=202)
+def reanalyze_report(report_id: str, request: ReanalyzeRequest, background_tasks: BackgroundTasks) -> dict:
+    """用已归档的原视频重新分析，可指定泳姿（用户修正后），无需重新上传。"""
+    with state_lock:
+        report = reports.get(report_id)
+        if not report:
+            raise HTTPException(status_code=404, detail="报告不存在。")
+        sport = report.get("sport")
+        source_hash = str(report.get("sourceHash") or "")
+        file_name = report.get("fileName") or "training-video"
+        stored_stroke = report.get("swimStroke", {}).get("stroke")
+
+    if sport not in {"running", "swimming"}:
+        raise HTTPException(status_code=400, detail="该报告不支持重新分析。")
+
+    source_path = _archived_source_path(source_hash)
+    if not source_path:
+        raise HTTPException(status_code=409, detail="原视频已不可用，请重新上传该视频后再分析。")
+
+    swim_stroke_hint: str | None = None
+    if sport == "swimming":
+        # 优先用请求显式指定的泳姿，否则沿用报告当前（可能已被用户修正的）泳姿
+        swim_stroke_hint = request.swimStroke or (stored_stroke if stored_stroke not in {None, "unknown"} else None)
+
+    new_report_id = uuid.uuid4().hex
+    job_id = uuid.uuid4().hex
+    # 复制归档视频到临时上传路径，交给现有分析流程（结束后会重新归档/清理）
+    work_path = UPLOAD_DIR / f"{job_id}{source_path.suffix.lower()}"
+    try:
+        shutil.copy2(str(source_path), str(work_path))
+    except OSError as exc:
+        logger.exception("Failed to stage archived source for reanalyze %s", report_id)
+        raise HTTPException(status_code=500, detail="准备原视频失败，请稍后重试。") from exc
+
+    job = {
+        "id": job_id,
+        "sport": sport,
+        "status": "queued",
+        "progress": 5,
+        "stage": "等待分析",
+        "reportId": None,
+        "errorCode": None,
+        "errorMessage": None,
+        "sourceHash": source_hash,
+    }
+    with state_lock:
+        jobs[job_id] = job
+    background_tasks.add_task(_process_job, job_id, new_report_id, work_path, file_name, sport, source_hash, swim_stroke_hint)
+    return job
 
 
 @app.post("/api/reports/{report_id}/feedback", status_code=201)
@@ -370,3 +537,61 @@ def create_report_feedback(report_id: str, feedback: ReportFeedback) -> dict:
         with FEEDBACK_FILE.open("a", encoding="utf-8") as destination:
             destination.write(json.dumps(record, ensure_ascii=False) + "\n")
     return record
+
+
+@app.get("/api/feedback/stats")
+def feedback_stats() -> dict:
+    """聚合已收集的用户反馈，闭环利用：暴露每类建议(insightId)的
+    准确/不准确比例，用于定位「哪些规则最常被用户判为不准」以指导调参。
+
+    negativeValues（inaccurate/unclear/not_visible/not_suitable）计为「不满意」，
+    accurate 计为「满意」。inaccurateRate 越高说明该建议越需要人工复查。
+    """
+    negative_values = {"inaccurate", "unclear", "not_visible", "not_suitable"}
+    if not FEEDBACK_FILE.exists():
+        return {"total": 0, "byInsight": [], "byValue": {}, "overallInaccurateRate": 0.0}
+
+    by_insight: dict[str, dict[str, int]] = {}
+    by_value: dict[str, int] = {}
+    total = 0
+    negatives = 0
+    for line in FEEDBACK_FILE.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        insight_id = str(record.get("insightId") or "unknown")
+        value = str(record.get("value") or "unknown")
+        total += 1
+        by_value[value] = by_value.get(value, 0) + 1
+        bucket = by_insight.setdefault(insight_id, {"total": 0, "accurate": 0, "negative": 0})
+        bucket["total"] += 1
+        if value == "accurate":
+            bucket["accurate"] += 1
+        elif value in negative_values:
+            bucket["negative"] += 1
+            negatives += 1
+
+    by_insight_rows = sorted(
+        (
+            {
+                "insightId": insight_id,
+                "total": stats["total"],
+                "accurate": stats["accurate"],
+                "negative": stats["negative"],
+                "inaccurateRate": round(stats["negative"] / stats["total"], 3) if stats["total"] else 0.0,
+            }
+            for insight_id, stats in by_insight.items()
+        ),
+        key=lambda row: (row["inaccurateRate"], row["total"]),
+        reverse=True,
+    )
+    return {
+        "total": total,
+        "byValue": by_value,
+        "byInsight": by_insight_rows,
+        "overallInaccurateRate": round(negatives / total, 3) if total else 0.0,
+    }

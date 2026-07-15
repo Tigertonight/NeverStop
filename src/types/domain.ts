@@ -10,13 +10,19 @@ export interface Metric {
   tone: 'positive' | 'warning' | 'neutral'
 }
 
+export interface MetricTrend {
+  key: string
+  label: string
+  unit: string
+  previous: number
+  current: number
+  delta: number
+  direction: 'improved' | 'regressed' | 'stable' | 'changed'
+}
+
 export interface Insight {
   id: string
   title: string
-  displayName?: string
-  createdAt?: string
-  trainingDate?: string
-  sourceHash?: string
   summary: string
   impact?: string
   action: string
@@ -35,6 +41,10 @@ export interface AnalysisReport {
   sport: Sport
   title: string
   date: string
+  displayName?: string
+  createdAt?: string
+  trainingDate?: string
+  sourceHash?: string
   duration: string
   score: number
   headline: string
@@ -62,7 +72,8 @@ export interface AnalysisReport {
   prescription?: { priorityIssueId: string; reason: string; drill: string; volume: string; rest: string; focusCue: string; successCue: string }
   pipeline?: { pipelineVersion: string; poseModelVersion: string; ruleVersion: string; promptVersion: string }
   modelReview?: { status: 'reviewed' | 'engineering_fallback'; reason: string; evidenceValidated: boolean }
-  comparison?: { status: 'comparable' | 'not_comparable'; previousReportId?: string; improved?: string[]; remaining?: string[]; newIssues?: string[]; basis?: string; reason?: string }
+  comparison?: { status: 'comparable' | 'not_comparable'; previousReportId?: string; previousDate?: string; improved?: string[]; remaining?: string[]; newIssues?: string[]; metricTrends?: MetricTrend[]; basis?: string; reason?: string }
+  keyMeasurements?: Record<string, { value: number; unit: string; label: string; betterWhen: 'lower' | 'higher' | 'range'; target?: number }>
   fileName?: string
   metadata?: {
     fps: number
@@ -100,4 +111,12 @@ export interface DataSource {
   name: string
   status: 'native_required' | 'web_oauth' | 'planned'
   detail: string
+}
+
+export interface ManualRecordInput {
+  sport: Sport
+  distance: number
+  minutes: number
+  seconds: number
+  date: string
 }
